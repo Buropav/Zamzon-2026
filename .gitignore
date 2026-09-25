@@ -22,3 +22,6 @@ archive/
 
 # OS files
 .DS_Store
+
+# Built submission packages
+*_submission.zip
