@@ -13,7 +13,9 @@ which appears only in test). Metric: per-entity macro F0.5. Full problem text: `
 | `dataset/{train,test,dev}` | Challenge data (not versioned) |
 | `utils/validate_submission.py` | Official output validator |
 | `docs/` | Problem statement, documentation template, methodology notes |
-| `output/` | Latest `matching_results.tsv` / `candidate_pairs.tsv` |
+| `submissions/` | One dated folder per leaderboard submission (notebook, metrics, notes) + git tag `sub-*` |
+| `tools/record_submission.py` | Creates a submission entry and its tag |
+| `output/` | Latest `matching_results.tsv` / `candidate_pairs.tsv` (not versioned) |
 | `archive/` | Superseded scripts, old artifacts and backups |
 
 ## Common commands
