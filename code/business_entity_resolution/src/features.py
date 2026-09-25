@@ -67,13 +67,17 @@ def pair_features(cand, s1, s23, workers=-1, n_jobs=None):
     order = list(_pair_features(cand.iloc[:200], s1, s23, workers).columns)
     keep1 = [c for c in s1.columns if c not in _DROP_FOR_WORKERS]
     keep2 = [c for c in s23.columns if c not in _DROP_FOR_WORKERS]
-    tasks = []
-    for p in np.array_split(np.arange(len(cand)), n * 3):
-        c = cand.iloc[p].copy()
+    n_parts = max(n * 3, int(np.ceil(len(cand) / MAX_PAIRS_PER_TASK)))  # small tasks bound worker memory
+    parts = np.array_split(np.arange(len(cand)), n_parts)
+
+    def make(i):
+        c = cand.iloc[parts[i]].copy()
         qu, qinv = np.unique(c["qi"].to_numpy(), return_inverse=True)
         du, dinv = np.unique(c["di"].to_numpy(), return_inverse=True)
         c["qi"], c["di"] = qinv, dinv
-        tasks.append((c, s1.iloc[qu][keep1].reset_index(drop=True), s23.iloc[du][keep2].reset_index(drop=True)))
+        return c, s1.iloc[qu][keep1].reset_index(drop=True), s23.iloc[du][keep2].reset_index(drop=True)
+
+    tasks = _Lazy(len(parts), make)  # built one at a time as workers ask for them
     F = pd.concat(_fork_map(_pf_task, tasks, n))
     del tasks
     for key, arr in _idfcos(cand, s1, s23).items():
@@ -87,38 +91,82 @@ def _jacc(x, y):
 
 
 N_JOBS = int(os.environ.get("ER_N_JOBS", "0")) or (os.cpu_count() or 1)
+MAX_PAIRS_PER_TASK = 100_000
+
+
+class _Lazy:
+    """Sequence whose items are built on demand (keeps only in-flight tasks in memory)."""
+
+    def __init__(self, n, make):
+        self.n, self.make = n, make
+
+    def __len__(self):
+        return self.n
+
+    def __iter__(self):
+        return (self.make(i) for i in range(self.n))
 _DROP_FOR_WORKERS = ("business_name", "business_address", "ml_addr")
 
 
 def _fork_map(fn, items, n):
-    """Ordered map over n forked worker processes. Workers inherit `fn` and `items` through fork (nothing
-    is pickled on the way in, so it also works for notebook-defined functions); only results come back.
+    """Ordered map over n forked worker processes. `fn` is inherited through fork (works for notebook-
+    defined functions); each task is PICKLED to the worker through a bounded queue, so workers only touch
+    their own private copy and never the parent's objects (reading an inherited Python object writes its
+    reference count, which would copy that memory page into every worker). Results come back pickled.
     Raises instead of hanging if a worker fails or is killed (e.g. out of memory)."""
     import gc as _gc
     import multiprocessing as mp
     import queue as _queue
+    import threading
     import traceback
     ctx = mp.get_context("fork")
-    q = ctx.Queue()
+    tasks, results = ctx.Queue(maxsize=max(2, n)), ctx.Queue()
 
-    def work(w):
-        for i in range(w, len(items), n):
-            try:
-                q.put((i, True, fn(items[i])))
-            except BaseException:
-                q.put((i, False, traceback.format_exc()))
+    def work():
+        while True:
+            job = tasks.get()
+            if job is None:
                 return
+            i, payload = job
+            del job
+            try:
+                results.put((i, True, fn(payload)))
+            except BaseException:
+                results.put((i, False, traceback.format_exc()))
+                return
+            del payload
 
     _gc.collect()
     _gc.freeze()
-    procs = [ctx.Process(target=work, args=(w,), daemon=True) for w in range(min(n, len(items)))]
+    procs = [ctx.Process(target=work, daemon=True) for _ in range(min(n, len(items)))]
+    for p in procs:
+        p.start()
+    _gc.unfreeze()
+    stop = threading.Event()
+
+    def feed():
+        for i, it in enumerate(items):
+            while not stop.is_set():
+                try:
+                    tasks.put((i, it), timeout=1)
+                    break
+                except _queue.Full:
+                    continue
+        for _ in procs:
+            while not stop.is_set():
+                try:
+                    tasks.put(None, timeout=1)
+                    break
+                except _queue.Full:
+                    continue
+
+    feeder = threading.Thread(target=feed, daemon=True)
+    feeder.start()
     try:
-        for p in procs:
-            p.start()
         out, done = [None] * len(items), 0
         while done < len(items):
             try:
-                i, ok, val = q.get(timeout=5)
+                i, ok, val = results.get(timeout=5)
             except _queue.Empty:
                 dead = [p for p in procs if not p.is_alive() and p.exitcode not in (0, None)]
                 if dead:
@@ -130,11 +178,12 @@ def _fork_map(fn, items, n):
             done += 1
         return out
     finally:
+        stop.set()
         for p in procs:
+            p.join(timeout=5)
             if p.is_alive():
                 p.terminate()
-            p.join(timeout=5)
-        _gc.unfreeze()
+        feeder.join(timeout=5)
 
 
 def _prepare_rows(df, drop=()):
@@ -152,7 +201,23 @@ def _prepare_rows(df, drop=()):
     df["nums"] = df["norm_addr"].map(lambda s: frozenset(_NUM.findall(str(s))))
     df["ckey"] = df["country"].map(country_key)
     df["distinct"] = [" ".join(distinct_tokens(n, _LEX, c)) for n, c in zip(df["norm_name"], df["ckey"])]
+    _share_objects(df)
     return df.drop(columns=list(drop), errors="ignore")
+
+
+def _share_objects(df):
+    """Same values, less memory (~550 bytes/row on 10M rows): identical number-sets become one shared
+    object (97% of name number-sets are empty), and core / distinct / DBA parts equal to the normalised
+    name reuse that string instead of holding a copy."""
+    for col in ("nums", "ml_name_nums"):
+        if col in df:
+            cache = {}
+            df[col] = [cache.setdefault(v, v) for v in df[col]]
+    name = df["norm_name"].to_numpy(object)
+    for col in ("core", "distinct"):
+        df[col] = [n if v == n else v for v, n in zip(df[col].to_numpy(object), name)]
+    if "ml_dba" in df:
+        df["ml_dba"] = [(n,) if len(t) == 1 and t[0] == n else t for t, n in zip(df["ml_dba"], name)]
 
 
 def _prepare_rows_task(args):
@@ -165,7 +230,11 @@ def prepare_side(df, drop=(), n_jobs=None):
     n = n_jobs or N_JOBS
     if n > 1 and len(df) >= 40_000:
         parts = np.array_split(np.arange(len(df)), n * 4)
-        out = pd.concat(_fork_map(_prepare_rows_task, [(df.iloc[p], tuple(drop)) for p in parts], n))
+        out = pd.concat(_fork_map(_prepare_rows_task, _Lazy(len(parts), lambda i: (df.iloc[parts[i]], tuple(drop))), n))
+        for col in ("nums", "ml_name_nums"):  # share identical sets across worker parts too
+            if col in out:
+                cache = {}
+                out[col] = [cache.setdefault(v, v) for v in out[col]]
     else:
         out = _prepare_rows(df, drop)
     out["core_freq"] = out.groupby(["country", "core"])["core"].transform("size").astype(np.float32)

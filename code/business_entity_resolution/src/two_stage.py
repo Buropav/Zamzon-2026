@@ -106,6 +106,45 @@ def _topk_gpu(Q, DT, k, min_sim, gpu, batch=1024):
     return np.concatenate(rs), np.concatenate(cs_), np.concatenate(vs)
 
 
+def _gpu_devices(gpu):
+    """Devices to use: all visible GPUs (override with ER_GPU_DEVICES="0,1")."""
+    env = os.environ.get("ER_GPU_DEVICES")
+    if env:
+        return [int(x) for x in env.split(",") if x.strip()]
+    return list(range(gpu[0].cuda.runtime.getDeviceCount()))
+
+
+def _topk_multi_gpu(Q, DT, k, min_sim, gpu):
+    """Split the Source 1 rows across GPUs (one thread per device; each gets its own copy of DT).
+    CuPy work on one device does not block Python threads driving another, so devices run in parallel.
+    Rows keep their order, so results are identical to a single-GPU run."""
+    import threading
+    cp = gpu[0]
+    devs = _gpu_devices(gpu)
+    if len(devs) < 2 or Q.shape[0] < 2 * 1024:
+        with cp.cuda.Device(devs[0] if devs else 0):
+            return _topk_gpu(Q, DT, k, min_sim, gpu)
+    bounds = np.linspace(0, Q.shape[0], len(devs) + 1).astype(int)
+    out, errs = [None] * len(devs), []
+
+    def run(j):
+        try:
+            with cp.cuda.Device(devs[j]):
+                r, c, v = _topk_gpu(Q[bounds[j]:bounds[j + 1]], DT, k, min_sim, gpu)
+            out[j] = (r + bounds[j], c, v)
+        except BaseException as e:  # re-raised below -> CPU fallback for this view
+            errs.append(e)
+
+    th = [threading.Thread(target=run, args=(j,)) for j in range(len(devs))]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    if errs:
+        raise errs[0]
+    return tuple(np.concatenate([o[i] for o in out]) for i in range(3))
+
+
 def iter_candidate_chunks(qp, dp, chunk_size=250_000, min_sim=0.015, max_df=0.01, log=None):
     """Country-partitioned char 3-4gram TF-IDF blocking, 3 views, top-k each. Per country and view the
     vectoriser is fitted ONCE on the Source 2/3 side and all Source 1 records of that country are scored
@@ -129,7 +168,7 @@ def iter_candidate_chunks(qp, dp, chunk_size=250_000, min_sim=0.015, max_df=0.01
             r, c, v = None, None, None
             if gpu is not None:
                 try:
-                    r, c, v = _topk_gpu(Q, DT, kk, min_sim, gpu)
+                    r, c, v = _topk_multi_gpu(Q, DT, kk, min_sim, gpu)
                 except Exception as e:  # any GPU failure -> CPU for this view
                     print(f"  (GPU blocking failed for {g}/{name}: {type(e).__name__}; using CPU)")
             if r is None:
@@ -139,7 +178,7 @@ def iter_candidate_chunks(qp, dp, chunk_size=250_000, min_sim=0.015, max_df=0.01
             gc.collect()
         if log:
             log(f"  blocking {g}: {len(q_all):,} S1 x {len(d_all):,} S23 in {time.time() - t0:.0f}s "
-                f"({'GPU' if gpu else 'CPU'})")
+                f"({f'{len(_gpu_devices(gpu))} GPU' if gpu else 'CPU'})")
         for s in range(0, len(q_all), chunk_size):
             e = min(s + chunk_size, len(q_all))
             blocks = {}
