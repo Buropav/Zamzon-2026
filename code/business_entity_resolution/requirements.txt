@@ -1,0 +1,11 @@
+rapidfuzz==3.14.6
+datasketch==1.6.5
+indic-transliteration==2.3.62
+lightgbm==4.6.0
+scikit-learn==1.7.2
+scipy==1.15.2
+pandas==2.2.3
+numpy==2.2.4
+tqdm==4.67.1
+xgboost==3.4.1
+# optional, enables GPU blocking: cupy-cuda12x
