@@ -12,6 +12,7 @@ from .text import core_name, _initials, normalize_text, canon_country
 from . import er_multilingual as _ML
 from .er_multilingual import ml_pair_features
 from .er_lexicon import load_default, country_aware, country_key, distinct_tokens, name_conflict
+from .geo import region_key
 _LEX = load_default()
 prepare_ml = country_aware(_ML.prepare_ml, vars(_ML), _LEX)
 # </package-only>
@@ -201,6 +202,7 @@ def _prepare_rows(df, drop=()):
     df["nums"] = df["norm_addr"].map(lambda s: frozenset(_NUM.findall(str(s))))
     df["ckey"] = df["country"].map(country_key)
     df["distinct"] = [" ".join(distinct_tokens(n, _LEX, c)) for n, c in zip(df["norm_name"], df["ckey"])]
+    df["region"] = [region_key(c, a) for c, a in zip(df["country"], df["ml_addr"])]
     _share_objects(df)
     return df.drop(columns=list(drop), errors="ignore")
 

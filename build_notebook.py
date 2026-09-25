@@ -208,8 +208,8 @@ print("Lexicon loaded:", {{c: len(v["tok"]["name"]) + len(v["tok"]["addr"]) + le
 # Cell 8: Scalable Country-Partitioned Blocking
 code(inline("blocking.py"))
 
-# Cell 9: Unified Feature Engineering
-code(inline("features.py"))
+# Cell 9: Region keys (state / region) for regional blocking, then unified feature engineering
+code(inline("geo.py") + "\n\n\n" + inline("features.py"))
 
 # Cell 10: Metric & Decision Policy
 code(inline("metrics.py"))

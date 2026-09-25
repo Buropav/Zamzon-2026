@@ -31,7 +31,9 @@ LGB_PARAMS = dict(n_estimators=1500, learning_rate=0.05, num_leaves=63, subsampl
                   colsample_bytree=0.8, min_child_samples=40, random_state=42, n_jobs=-1, verbose=-1)
 
 
-BLOCKERS = (("name", 25), ("core", 15), ("text", 20))  # (view, top-k per Source 1)
+BLOCKERS = (("name", 20), ("core", 10), ("text", 40))  # (view, top-k per Source 1); chosen at test scale:
+# India, 4.1M-record pool, region blocking: 25/15/20 -> recall 0.9245 (41 cands), 20/10/40 -> 0.9372 (55 cands)
+MAX_DF_FLOOR = int(os.environ.get("ER_MAX_DF_FLOOR", "0"))
 USE_GPU = os.environ.get("ER_USE_GPU", "1") != "0"
 
 
@@ -145,49 +147,86 @@ def _topk_multi_gpu(Q, DT, k, min_sim, gpu):
     return tuple(np.concatenate([o[i] for o in out]) for i in range(3))
 
 
-def iter_candidate_chunks(qp, dp, chunk_size=250_000, min_sim=0.015, max_df=0.01, log=None):
-    """Country-partitioned char 3-4gram TF-IDF blocking, 3 views, top-k each. Per country and view the
-    vectoriser is fitted ONCE on the Source 2/3 side and all Source 1 records of that country are scored
-    (on the GPU when available). Yields (qidx, cands) per Source 1 chunk, with cands.qi LOCAL to
-    qp.iloc[qidx] and cands.di global."""
-    gpu = _gpu()
-    qc, dc = qp["country"].to_numpy(object), dp["country"].to_numpy(object)
-    for g in pd.unique(qc):
-        q_all = np.flatnonzero(qc == g)
-        d_all = np.arange(len(dp)) if g == "" else np.flatnonzero((dc == g) | (dc == ""))
-        if len(q_all) == 0 or len(d_all) == 0:
+def _block_group(qp, dp, q_idx, d_idx, gpu, min_sim, max_df):
+    """Top-k for every view of one blocking group -> {view: (r local to q_idx, di global, sim)}."""
+    views = {}
+    if max_df < 1:  # relative -> absolute, with a floor so small regional pools keep informative n-grams
+        max_df = max(int(np.ceil(max_df * len(d_idx))), MAX_DF_FLOOR)
+    for name, k in BLOCKERS:
+        vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4), min_df=2, max_df=max_df,
+                              sublinear_tf=True, dtype=np.float32)
+        try:
+            DT = vec.fit_transform(_view(dp.iloc[d_idx], name)).T.tocsr()
+        except ValueError:  # tiny pool: no n-gram survives min_df/max_df
+            views[name] = (np.array([], np.int64), np.array([], np.int64), np.array([], np.float32))
             continue
-        t0 = time.time()
-        views = {}
-        for name, k in BLOCKERS:
-            vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4), min_df=2, max_df=max_df,
-                                  sublinear_tf=True, dtype=np.float32)
-            DT = vec.fit_transform(_view(dp.iloc[d_all], name)).T.tocsr()
-            Q = vec.transform(_view(qp.iloc[q_all], name)).tocsr()
-            kk = min(k, len(d_all))
-            r, c, v = None, None, None
-            if gpu is not None:
-                try:
-                    r, c, v = _topk_multi_gpu(Q, DT, kk, min_sim, gpu)
-                except Exception as e:  # any GPU failure -> CPU for this view
-                    print(f"  (GPU blocking failed for {g}/{name}: {type(e).__name__}; using CPU)")
-            if r is None:
-                r, c, v = _topk_cpu(Q, DT, kk, min_sim)
-            views[name] = (r, d_all[c], v)
-            del vec, DT, Q
-            gc.collect()
-        if log:
-            log(f"  blocking {g}: {len(q_all):,} S1 x {len(d_all):,} S23 in {time.time() - t0:.0f}s "
-                f"({f'{len(_gpu_devices(gpu))} GPU' if gpu else 'CPU'})")
+        Q = vec.transform(_view(qp.iloc[q_idx], name)).tocsr()
+        kk = min(k, len(d_idx))
+        r = c = v = None
+        if gpu is not None:
+            try:
+                r, c, v = _topk_multi_gpu(Q, DT, kk, min_sim, gpu)
+            except Exception as e:  # any GPU failure -> CPU for this view
+                print(f"  (GPU blocking failed: {type(e).__name__}; using CPU)")
+        if r is None:
+            r, c, v = _topk_cpu(Q, DT, kk, min_sim)
+        views[name] = (r, d_idx[c], v)
+        del vec, DT, Q
+    return views
+
+
+def _groups(qp, dp):
+    """Blocking groups: (label, q_idx, d_idx). Within a country, a Source 1 record with a known region is
+    searched in that region plus Source 2/3 records whose region is unknown; unknown-region Source 1 records
+    are searched in the whole country. Countries without region rules (e.g. a new country) are one group."""
+    qc, dc = qp["country"].to_numpy(object), dp["country"].to_numpy(object)
+    qr = qp["region"].to_numpy(object) if "region" in qp else np.full(len(qp), "", object)
+    dr = dp["region"].to_numpy(object) if "region" in dp else np.full(len(dp), "", object)
+    for g in pd.unique(qc):
+        q_c = qc == g
+        d_c = np.ones(len(dp), bool) if g == "" else (dc == g) | (dc == "")
+        for r in sorted(pd.unique(qr[q_c]), key=lambda x: (x == "", x)):
+            q_idx = np.flatnonzero(q_c & (qr == r))
+            d_idx = np.flatnonzero(d_c if r == "" else d_c & ((dr == r) | (dr == "")))
+            if len(q_idx) and len(d_idx):
+                yield f"{g}/{r or '*'}", q_idx, d_idx
+
+
+def iter_candidate_chunks(qp, dp, chunk_size=250_000, min_sim=0.015, max_df=0.01, log=None):
+    """Char 3-4gram TF-IDF blocking, 3 views, top-k each, per (country, region) group (see _groups),
+    on the GPU when available. Groups are packed into chunks of about chunk_size Source 1 records.
+    Yields (qidx, cands) with cands.qi LOCAL to qp.iloc[qidx] and cands.di global."""
+    gpu = _gpu()
+    buf_q, buf_c, n_buf = [], [], 0
+    t0 = time.time()
+
+    def flush():
+        qidx = np.concatenate(buf_q)
+        off = np.cumsum([0] + [len(x) for x in buf_q[:-1]])
+        cands = pd.concat([c.assign(qi=c["qi"].to_numpy() + o) for c, o in zip(buf_c, off)], ignore_index=True)
+        return qidx, cands
+
+    for label, q_all, d_all in _groups(qp, dp):
+        views = _block_group(qp, dp, q_all, d_all, gpu, min_sim, max_df)
+        if log and (len(q_all) >= 20_000 or label.endswith("*")):
+            log(f"  blocking {label}: {len(q_all):,} S1 x {len(d_all):,} S23 ({time.time() - t0:.0f}s, "
+                f"{f'{len(_gpu_devices(gpu))} GPU' if gpu else 'CPU'})")
         for s in range(0, len(q_all), chunk_size):
             e = min(s + chunk_size, len(q_all))
             blocks = {}
             for name, (r, d, v) in views.items():
                 lo, hi = np.searchsorted(r, s), np.searchsorted(r, e)  # r is sorted (row-major)
                 blocks[name] = pd.DataFrame({"qi": r[lo:hi] - s, "di": d[lo:hi], "sim": v[lo:hi]})
-            yield q_all[s:e], union_candidates(blocks)
+            buf_q.append(q_all[s:e])
+            buf_c.append(union_candidates(blocks))
+            n_buf += e - s
+            if n_buf >= chunk_size:
+                yield flush()
+                buf_q, buf_c, n_buf = [], [], 0
         del views
         gc.collect()
+    if buf_q:
+        yield flush()
 
 
 def block_candidates(qp, dp, log=None):
