@@ -45,7 +45,7 @@ from src.er_lexicon import embed as _embed_resources  # noqa: E402
 # Title
 md("""
 # Amazon ML Challenge 2026: Business Entity Resolution
-### Multilingual Normalization + Static Lexicon, Multi-View Blocking, Two-Stage LightGBM
+### Multilingual Normalization + Static Lexicon, Multi-View Blocking, Two-Stage GBDT (XGBoost on GPU)
 
 **Pipeline**:
 - **Data**: read directly from the attached Kaggle dataset (`/kaggle/input/...`), no downloads.
@@ -54,7 +54,7 @@ md("""
   typos, OCR digit noise) embedded in cell 7. Built offline once; no API is called here.
 - **Training data**: every record of whole regions (density preserved), split 60/20/20 by Source 1.
 - **Blocking**: 3-view country-partitioned char TF-IDF; vectorisers fitted once per country.
-- **Matching**: stage-1 LightGBM on pair features -> stage-2 LightGBM with group context (out-of-fold).
+- **Matching**: stage-1 GBDT on pair features -> stage-2 GBDT with group context (out-of-fold); XGBoost on GPU, LightGBM on CPU-only machines.
 - **Selection**: two thresholds (tau1, tau2) tuned on Macro F0.5, globally one-to-one.
 - **Inference**: Source 1 chunks, stage-2 inputs cached on disk (float16), all 1.73M Source 1 rows written.
 
@@ -225,7 +225,7 @@ code(inline("two_stage.py"))
 
 # Cell 14: Training
 code("""
-# [EXECUTION 1] Density-preserving training sample -> normalisation -> blocking -> two-stage LightGBM
+# [EXECUTION 1] Density-preserving training sample -> normalisation -> blocking -> two-stage GBDT (XGBoost on GPU)
 T0 = time.time()
 TRAIN_REGIONS = ("PUNJAB",) if DEV_MODE else DEFAULT_REGIONS
 print("Loading training data...")
