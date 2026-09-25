@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+
+# Data and generated outputs
+dataset/
+output/
+stage2_cache/
+jev/work/
+jev/jev_cache.jsonl
+archive/
+
+# OS files
+.DS_Store

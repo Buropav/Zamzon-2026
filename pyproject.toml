@@ -1,0 +1,37 @@
+[project]
+name = "entity-resolution"
+version = "0.1.0"
+description = "Business entity resolution (ML Challenge 2026)"
+readme = "README.md"
+authors = [
+    { name = "Anurup R Krishnan", email = "anuruprkrishnan@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "datasketch>=2.0.0",
+    "indic-transliteration>=2.3.82",
+    "ipykernel>=7.3.0",
+    "jupyter>=1.1.1",
+    "lightgbm>=4.7.0",
+    "matplotlib>=3.11.2",
+    "nbconvert>=7.17.1",
+    "nbformat>=5.11.1",
+    "numpy>=2.5.3",
+    "pandas>=3.0.6",
+    "pip>=26.2.1",
+    "requests>=2.32",
+    "rapidfuzz>=3.14.6",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
+    "seaborn>=0.13.2",
+    "tqdm>=4.70.1",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "cupy-cuda12x[ctk]>=14.2.0",
+    "xgboost>=3.4.1",
+]
