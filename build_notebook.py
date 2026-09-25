@@ -315,12 +315,13 @@ with open(WORKING_DIR / "metrics.json", "w") as f:
     json.dump(metrics_data, f, indent=2)
 print(json.dumps(metrics_data, indent=2))
 
+_backend_name = {"xgb": "XGBoost (GPU)", "lgbm": "LightGBM"}.get(resolve_backend(), resolve_backend())
 methodology_content = f\"\"\"# Business Entity Resolution - Methodology
 ### Team: zamzon_ai
 
 ## Summary
 Multilingual normalisation with an offline-built static lexicon, 3-view country-partitioned TF-IDF
-blocking, a two-stage LightGBM matcher (pair features, then group context) and a two-threshold,
+blocking, a two-stage {_backend_name} matcher (pair features, then group context) and a two-threshold,
 globally one-to-one selection. Held-out Macro F0.5 on whole training regions: **{model['f05_test']:.4f}**
 (stage 1 alone: {model['f05_test_stage1']:.4f}); training blocking recall {recall*100:.2f}%.
 
@@ -337,15 +338,15 @@ globally one-to-one selection. Held-out Macro F0.5 on whole training regions: **
   time; the pipeline reads static TSV files. Every rule was checked against training labels where they exist.
 
 ## 2. Blocking
-Country-partitioned char 3-4gram TF-IDF (max_df=0.01) on name (top 25), core name (top 15) and
+Country-partitioned char 3-4gram TF-IDF (max_df=0.01, sparse products on the GPU via CuPy when available) on name (top 25), core name (top 15) and
 name+address (top 20); union. Vectorisers are fitted once per country on Source 2/3.
 Test: {len(test_cands):,} candidate pairs for {len(test_s1):,} Source 1 entities.
 
 ## 3. Matching model
-- Stage 1: LightGBM on ~57 pair features (fuzzy name/core/address ratios, IDF cosines, postcode / house /
+- Stage 1: {_backend_name} on ~57 pair features (fuzzy name/core/address ratios, IDF cosines, postcode / house /
   unit agreement, phonetic keys, DBA and landmark handling, distinctive-word similarity, look-alike name
   conflict flag, blocker similarities).
-- Stage 2: LightGBM on the stage-1 score plus group context: rank and margin inside the Source 1 group and
+- Stage 2: {_backend_name} on the stage-1 score plus group context: rank and margin inside the Source 1 group and
   among all Source 1 entities competing for the same Source 2/3 record, similarity to the best other
   candidate, same-address support. Stage-1 scores for stage-2 training are out-of-fold.
 - Training data: every record of whole regions ({', '.join(TRAIN_REGIONS)}) to keep test-like density.
