@@ -80,6 +80,13 @@ def s1_side_features(cands, p_col, s23, strong=(0.5, 0.9)):
     _, n_a, _, bo_a = _side_stats(codes, p)
     G["g_same_addr_n"] = np.where(addr != "", n_a - 1, 0)
     G["g_same_addr_max"] = np.where((addr != "") & (n_a > 1), bo_a, np.nan)
+    # same for the house number: true copies share the Source 1 number, a decoy's shifted number is alone
+    if "addr_nums" in s23:
+        hn = np.array([x.split(" ", 1)[0] for x in s23["addr_nums"].to_numpy()[di]], dtype=object)
+        codes = pd.factorize(pd.Series(qi).astype(str) + "\x00" + pd.Series(hn))[0]
+        _, n_h, _, bo_h = _side_stats(codes, p)
+        G["g_same_hnum_n"] = np.where(hn != "", n_h - 1, np.nan)
+        G["g_same_hnum_max"] = np.where((hn != "") & (n_h > 1), bo_h, np.nan)
     return G.astype(np.float32)
 
 
@@ -93,7 +100,11 @@ def s23_side_features(cands, p_col):
 
 STAGE2_BASE = ["name_tset", "name_wr", "core_tset", "core_exact", "addr_tset", "addr_core_tset", "pc_eq",
                "house_eq", "num_jacc", "name_idfcos", "addr_idfcos", "blk_text", "blk_name", "n_blockers",
-               "name_soft_min", "addr_soft_max", "distinct_jacc", "name_conflict", "is_s3"]
+               "name_soft_min", "addr_soft_max", "distinct_jacc", "name_conflict", "is_s3",
+               # address numbers, compact names, token differences, extra blocking views (extra_feats.py)
+               "n_a", "n_b", "n_exact", "n_shift_up", "n_shift_down", "n_typo", "n_prefix", "n_a_left", "n_b_left",
+               "h_delta", "h_lev", "h_eq", "h_prefix", "h_in_b", "n_minshift", "cmp_partial", "cmp_contain",
+               "tk_b_word", "tk_a_word", "tk_subst", "tk_b_oov_share", "blk_addr", "blk_rtext", "blk_rname"]
 
 
 def stage2_matrix(X1, p1, G1, G23):

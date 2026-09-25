@@ -1,6 +1,12 @@
 """
 two_stage.py - candidate generation, two-stage GBDT matcher (LightGBM or XGBoost) and chunked, memory-safe inference.
 
+Blocking: char 3-4gram TF-IDF per (country, region) group, forward views (each Source 1 -> its top-k Source 2/3
+         records by name, core name, name+address, address) and reverse views (each Source 2/3 record -> its
+         top-k Source 1 records). Reverse retrieval is cheap and finds matches a crowded forward list drops
+         (Source 1 is deduplicated, so a Source 2/3 record has few look-alikes there).
+Prefilter: a small GBDT on blocking similarities + fast string/number features drops near-certain
+         non-matches (keeps ~12% of candidates and ~99.98% of true pairs) before the expensive features.
 Stage 1: pair classifier on pairwise features (features.pair_features).
 Stage 2: re-scores each pair with group context (groups.py): rank/margin of the stage-1 score inside
          the Source 1 group AND among all Source 1 entities competing for the same Source 2/3 record.
@@ -14,6 +20,7 @@ globally; pass 2 applies stage 2 chunk by chunk; selection is global.
 # <package-only>
 from .blocking import _topk_rows, union_candidates
 from .features import pair_features
+from .extra_feats import num_matrix, num_features
 from .groups import s1_side_features, s23_side_features, stage2_matrix
 from .metrics import macro_f05, select_matches, tune_policy
 # </package-only>
@@ -25,14 +32,22 @@ import time
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from rapidfuzz import fuzz
+from rapidfuzz.process import cpdist
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 LGB_PARAMS = dict(n_estimators=1500, learning_rate=0.05, num_leaves=63, subsample=0.8, subsample_freq=1,
                   colsample_bytree=0.8, min_child_samples=40, random_state=42, n_jobs=-1, verbose=-1)
 
 
-BLOCKERS = (("name", 20), ("core", 10), ("text", 40))  # (view, top-k per Source 1); chosen at test scale:
-# India, 4.1M-record pool, region blocking: 25/15/20 -> recall 0.9245 (41 cands), 20/10/40 -> 0.9372 (55 cands)
+BLOCKERS = (("name", 30), ("core", 15), ("text", 50), ("addr", 20))  # forward: (view, top-k per Source 1)
+REVERSE = (("text", 3), ("name", 2), ("addr", 2))                    # reverse: (view, top-k per Source 2/3)
+KEYS = (("kb", 30, 150), ("kb2", 30, 150))  # exact keys (view, max Source 1, max Source 2/3 per key value):
+# kb = house number + first 3 letters of a distinctive name word, kb2 = house number + compact name. They find
+# copies whose address was cut to "No 6, Bengaluru" and whose name is damaged, which TF-IDF top-k loses in dense
+# pools. Karnataka pool (69k S1 x 577k S2/S3): old blocking 0.9399 -> TF-IDF views 0.9654 -> + keys 0.9821.
+# Measured on whole training regions (Oregon + Kerala, 61k Source 1): old 20/10/40 forward only -> recall 0.9854
+# (53 cands/S1); + address view + reverse text/name/addr -> 0.9920-0.9932. The prefilter keeps the cost flat.
 MAX_DF_FLOOR = int(os.environ.get("ER_MAX_DF_FLOOR", "0"))
 USE_GPU = os.environ.get("ER_USE_GPU", "1") != "0"
 
@@ -58,6 +73,8 @@ def _view(p, name):
         return p["norm_name"].to_numpy(object)
     if name == "core":
         return p["core"].to_numpy(object)
+    if name == "addr":
+        return p["norm_addr"].to_numpy(object)
     return (p["norm_name"] + " " + p["norm_addr"]).to_numpy(object)
 
 
@@ -147,31 +164,83 @@ def _topk_multi_gpu(Q, DT, k, min_sim, gpu):
     return tuple(np.concatenate([o[i] for o in out]) for i in range(3))
 
 
+def _topk_any(Q, DT, k, min_sim, gpu):
+    r = c = v = None
+    if gpu is not None:
+        try:
+            r, c, v = _topk_multi_gpu(Q, DT, k, min_sim, gpu)
+        except Exception as e:  # any GPU failure -> CPU for this view
+            print(f"  (GPU blocking failed: {type(e).__name__}; using CPU)")
+    if r is None:
+        r, c, v = _topk_cpu(Q, DT, k, min_sim)
+    return r, c, v
+
+
+def _key_values(p, idx, kind):
+    """(row position in idx, key string) for exact-key blocking."""
+    nums = p["addr_nums"].to_numpy()[idx]
+    rows_i, rows_k = [], []
+    if kind == "kb":
+        names = p["distinct"].to_numpy()[idx]
+        for i, (ns, nm) in enumerate(zip(nums, names)):
+            toks = [t[:3] for t in str(nm).split() if not t.isdigit()][:2]
+            for n in ns.split()[:2]:
+                n = n.lstrip("0") or "0"
+                for t in toks:
+                    rows_i.append(i)
+                    rows_k.append(f"{n}|{t}")
+    else:
+        names = p["compact"].to_numpy()[idx]
+        for i, (ns, nm) in enumerate(zip(nums, names)):
+            if not nm:
+                continue
+            for n in ns.split()[:3]:
+                rows_i.append(i)
+                rows_k.append(f"{n.lstrip('0') or '0'}|{nm}")
+    return pd.DataFrame({"i": np.asarray(rows_i, np.int64), "k": rows_k})
+
+
+def _key_block(qp, dp, q_idx, d_idx, kind, max_q, max_d):
+    """Pairs sharing a key value, skipping values held by more than max_q Source 1 / max_d Source 2/3 records."""
+    A, B = _key_values(qp, q_idx, kind), _key_values(dp, d_idx, kind)
+    if A.empty or B.empty:
+        return np.array([], np.int64), np.array([], np.int64), np.array([], np.float32)
+    ca, cb = A["k"].value_counts(), B["k"].value_counts()
+    ok = ca.index[ca <= max_q].intersection(cb.index[cb <= max_d])
+    m = A[A["k"].isin(ok)].merge(B[B["k"].isin(ok)], on="k")[["i_x", "i_y"]].drop_duplicates()
+    m = m.sort_values("i_x", kind="stable")
+    r = m["i_x"].to_numpy(np.int64)
+    return r, d_idx[m["i_y"].to_numpy(np.int64)], np.ones(len(r), np.float32)
+
+
 def _block_group(qp, dp, q_idx, d_idx, gpu, min_sim, max_df):
-    """Top-k for every view of one blocking group -> {view: (r local to q_idx, di global, sim)}."""
+    """Top-k for every view of one blocking group -> {label: (r local to q_idx, di global, sim)}, r sorted.
+    Forward labels are the view name, reverse labels 'r' + view name."""
     views = {}
     if max_df < 1:  # relative -> absolute, with a floor so small regional pools keep informative n-grams
         max_df = max(int(np.ceil(max_df * len(d_idx))), MAX_DF_FLOOR)
-    for name, k in BLOCKERS:
+    fwd, rev = dict(BLOCKERS), dict(REVERSE)
+    empty = (np.array([], np.int64), np.array([], np.int64), np.array([], np.float32))
+    for name in list(dict.fromkeys(list(fwd) + list(rev))):
         vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4), min_df=2, max_df=max_df,
                               sublinear_tf=True, dtype=np.float32)
         try:
-            DT = vec.fit_transform(_view(dp.iloc[d_idx], name)).T.tocsr()
+            D = vec.fit_transform(_view(dp.iloc[d_idx], name)).tocsr()
         except ValueError:  # tiny pool: no n-gram survives min_df/max_df
-            views[name] = (np.array([], np.int64), np.array([], np.int64), np.array([], np.float32))
+            for lab in ([name] if name in fwd else []) + (["r" + name] if name in rev else []):
+                views[lab] = empty
             continue
         Q = vec.transform(_view(qp.iloc[q_idx], name)).tocsr()
-        kk = min(k, len(d_idx))
-        r = c = v = None
-        if gpu is not None:
-            try:
-                r, c, v = _topk_multi_gpu(Q, DT, kk, min_sim, gpu)
-            except Exception as e:  # any GPU failure -> CPU for this view
-                print(f"  (GPU blocking failed: {type(e).__name__}; using CPU)")
-        if r is None:
-            r, c, v = _topk_cpu(Q, DT, kk, min_sim)
-        views[name] = (r, d_idx[c], v)
-        del vec, DT, Q
+        if name in fwd:
+            r, c, v = _topk_any(Q, D.T.tocsr(), min(fwd[name], len(d_idx)), min_sim, gpu)
+            views[name] = (r, d_idx[c], v)
+        if name in rev:
+            rd, cq, v = _topk_any(D, Q.T.tocsr(), min(rev[name], len(q_idx)), min_sim, gpu)
+            o = np.argsort(cq, kind="stable")
+            views["r" + name] = (cq[o].astype(np.int64), d_idx[rd[o]], v[o])
+        del vec, D, Q
+    for kind, max_q, max_d in KEYS:
+        views[kind] = _key_block(qp, dp, q_idx, d_idx, kind, max_q, max_d)
     return views
 
 
@@ -193,7 +262,7 @@ def _groups(qp, dp):
 
 
 def iter_candidate_chunks(qp, dp, chunk_size=250_000, min_sim=0.015, max_df=0.01, log=None):
-    """Char 3-4gram TF-IDF blocking, 3 views, top-k each, per (country, region) group (see _groups),
+    """Char 3-4gram TF-IDF blocking, forward + reverse views (BLOCKERS, REVERSE), per (country, region) group (see _groups),
     on the GPU when available. Groups are packed into chunks of about chunk_size Source 1 records.
     Yields (qidx, cands) with cands.qi LOCAL to qp.iloc[qidx] and cands.di global."""
     gpu = _gpu()
@@ -218,7 +287,7 @@ def iter_candidate_chunks(qp, dp, chunk_size=250_000, min_sim=0.015, max_df=0.01
                 lo, hi = np.searchsorted(r, s), np.searchsorted(r, e)  # r is sorted (row-major)
                 blocks[name] = pd.DataFrame({"qi": r[lo:hi] - s, "di": d[lo:hi], "sim": v[lo:hi]})
             buf_q.append(q_all[s:e])
-            buf_c.append(union_candidates(blocks))
+            buf_c.append(_union_fast(blocks))
             n_buf += e - s
             if n_buf >= chunk_size:
                 yield flush()
@@ -227,6 +296,38 @@ def iter_candidate_chunks(qp, dp, chunk_size=250_000, min_sim=0.015, max_df=0.01
         gc.collect()
     if buf_q:
         yield flush()
+
+
+BLK_COLS = [f"blk_{n}" for n, _ in BLOCKERS] + [f"blk_r{n}" for n, _ in REVERSE] + [f"blk_{n}" for n, _, _ in KEYS]
+
+
+def _union_fast(blocks):
+    """{label: DataFrame(qi, di, sim)} -> one row per (qi, di) with blk_<label> similarity columns (NaN when
+    that view did not retrieve the pair) and n_blockers. Same content as blocking.union_candidates, faster."""
+    parts = [(lab, b) for lab, b in blocks.items() if len(b)]
+    if not parts:
+        return pd.DataFrame({"qi": np.array([], np.int64), "di": np.array([], np.int64),
+                             **{c: np.array([], np.float32) for c in BLK_COLS}, "n_blockers": np.array([], np.int64)})
+    qi = np.concatenate([b["qi"].to_numpy(np.int64) for _, b in parts])
+    di = np.concatenate([b["di"].to_numpy(np.int64) for _, b in parts])
+    key = qi * (int(di.max()) + 1) + di
+    uk, inv = np.unique(key, return_inverse=True)
+    first = np.full(len(uk), -1, np.int64)
+    first[inv[::-1]] = np.arange(len(inv))[::-1]
+    out = pd.DataFrame({"qi": qi[first], "di": di[first]})
+    off = 0
+    cols = {c: np.full(len(uk), np.nan, np.float32) for c in BLK_COLS}
+    for lab, b in parts:
+        n = len(b)
+        c = f"blk_{lab}"
+        if c not in cols:
+            cols[c] = np.full(len(uk), np.nan, np.float32)
+        np.fmax.at(cols[c], inv[off:off + n], b["sim"].to_numpy(np.float32))
+        off += n
+    for c, v in cols.items():
+        out[c] = v
+    out["n_blockers"] = np.isfinite(out[list(cols)].to_numpy()).sum(axis=1)
+    return out
 
 
 def block_candidates(qp, dp, log=None):
@@ -243,9 +344,58 @@ def block_candidates(qp, dp, log=None):
     return c
 
 
+# ------------------------------------------------------------------ prefilter
+PF_THRESHOLD_CAP = float(os.environ.get("ER_PF_CAP", "0.001"))
+PF_THRESHOLD_FLOOR = float(os.environ.get("ER_PF_FLOOR", "0.0001"))  # pairs below 1e-4 are never selected anyway
+
+
+def cheap_features(cands, qp, dp, workers=-1):
+    """Fast features for the prefilter: blocking similarities, 5 rapidfuzz scores, address-number alignment.
+    cands.qi -> rows of qp, cands.di -> rows of dp."""
+    qi, di = cands["qi"].to_numpy(), cands["di"].to_numpy()
+    F = pd.DataFrame({c: (cands[c].to_numpy(np.float32) if c in cands else np.full(len(cands), np.nan, np.float32))
+                      for c in BLK_COLS + ["n_blockers"]})
+    sc = lambda a, b, f: cpdist(a, b, scorer=f, workers=workers, dtype=np.float32) / 100.0  # noqa: E731
+    an, bn = qp["norm_name"].to_numpy()[qi], dp["norm_name"].to_numpy()[di]
+    F["c_name_ratio"] = sc(an, bn, fuzz.ratio)
+    F["c_name_tset"] = sc(an, bn, fuzz.token_set_ratio)
+    F["c_core_tset"] = sc(qp["core"].to_numpy()[qi], dp["core"].to_numpy()[di], fuzz.token_set_ratio)
+    F["c_addr_tset"] = sc(qp["norm_addr"].to_numpy()[qi], dp["norm_addr"].to_numpy()[di], fuzz.token_set_ratio)
+    F["c_cmp_partial"] = sc(qp["compact"].to_numpy()[qi], dp["compact"].to_numpy()[di], fuzz.partial_ratio)
+    uq, iq = np.unique(qi, return_inverse=True)
+    ud, id_ = np.unique(di, return_inverse=True)
+    N = num_features(num_matrix(qp["addr_nums"].to_numpy()[uq]), num_matrix(dp["addr_nums"].to_numpy()[ud]), iq, id_,
+                     parallel=True)
+    for c in ("n_a", "n_b", "n_exact", "n_shift_up", "n_a_left", "n_b_left", "h_delta", "h_eq"):
+        F[f"c_{c}"] = N[c].to_numpy()
+    return F
+
+
+def train_prefilter(C, y, part_of_row, keep_recall=0.9998, log=print):
+    """Small GBDT on cheap features. Fit on part 0; threshold = score below which at most (1 - keep_recall) of
+    the true pairs of parts 1-2 fall, clipped to [PF_THRESHOLD_FLOOR, PF_THRESHOLD_CAP]."""
+    fit = part_of_row == 0
+    m = _Model(resolve_backend(), n_estimators=300, learning_rate=0.1, max_depth=6, num_leaves=63).fit(C[fit], y[fit])
+    p = m.predict_proba(C)[:, 1]
+    ho = (~fit) & (y == 1)
+    th = float(np.quantile(p[ho], 1 - keep_recall)) if ho.any() else 0.0
+    th = min(max(th, PF_THRESHOLD_FLOOR), PF_THRESHOLD_CAP)
+    keep = p >= th
+    log(f"  prefilter: threshold {th:.5f}, keeps {keep.mean():.3f} of candidates, "
+        f"{(keep & (y == 1))[~fit].sum() / max((y == 1)[~fit].sum(), 1):.5f} of held-out true pairs")
+    return {"model": m, "threshold": th}, keep
+
+
+def apply_prefilter(cands, qp, dp, pf):
+    """-> boolean keep mask for cands."""
+    if pf is None or len(cands) == 0:
+        return np.ones(len(cands), bool)
+    return pf["model"].predict_proba(cheap_features(cands, qp, dp))[:, 1] >= pf["threshold"]
+
+
 # ------------------------------------------------------------------ model backends
 BACKEND = os.environ.get("ER_BACKEND", "auto")  # "auto" (xgb on GPU, else lgbm), "lgbm" or "xgb"
-XGB_PARAMS = dict(n_estimators=1500, learning_rate=0.05, max_depth=8, min_child_weight=5, subsample=0.8,
+XGB_PARAMS = dict(n_estimators=3000, learning_rate=0.05, max_depth=8, min_child_weight=5, subsample=0.8,
                   colsample_bytree=0.8, tree_method="hist", max_bin=256, eval_metric="logloss",
                   random_state=42, n_jobs=-1)
 
@@ -323,13 +473,7 @@ def train_two_stage(cands, X, y, n_true, s23p, seed=42, folds=5, log=print):
     """cands: qi, di (+ blocker cols). X: stage-1 features. y: labels. n_true: true match count per S1.
     Split by Source 1: 60% fit, 20% early stopping + threshold tuning, 20% held-out report."""
     qi = cands["qi"].to_numpy()
-    n_s1 = len(n_true)
-    rng = np.random.default_rng(seed)
-    perm = rng.permutation(n_s1)
-    part = np.empty(n_s1, np.int8)
-    part[perm[: int(0.6 * n_s1)]] = 0
-    part[perm[int(0.6 * n_s1): int(0.8 * n_s1)]] = 1
-    part[perm[int(0.8 * n_s1):]] = 2
+    part = split_parts(len(n_true), seed)
     pq = part[qi]
     tr, va = pq == 0, pq == 1
 
@@ -366,6 +510,36 @@ def train_two_stage(cands, X, y, n_true, s23p, seed=42, folds=5, log=print):
             "part": part, "pairs": c}
 
 
+def split_parts(n_s1, seed=42):
+    """Source 1 split used everywhere: 0 = fit (60%), 1 = early stopping + tuning (20%), 2 = held-out (20%)."""
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n_s1)
+    part = np.empty(n_s1, np.int8)
+    part[perm[: int(0.6 * n_s1)]] = 0
+    part[perm[int(0.6 * n_s1): int(0.8 * n_s1)]] = 1
+    part[perm[int(0.8 * n_s1):]] = 2
+    return part
+
+
+def fit_pipeline(cands_raw, s1p, s23p, y_raw, n_true, seed=42, log=print):
+    """Training entry point: prefilter (fit on the 60% part) -> pair features on kept candidates -> two stages.
+    Returns the model dict (with the prefilter) plus recall figures."""
+    t0 = time.time()
+    part = split_parts(len(s1p), seed)
+    C = cheap_features(cands_raw, s1p, s23p)
+    pf, keep = train_prefilter(C, y_raw, part[cands_raw["qi"].to_numpy()], log=log)
+    del C
+    cands = cands_raw[keep].reset_index(drop=True).reindex(columns=["qi", "di"] + BLK_COLS + ["n_blockers"])
+    y = np.asarray(y_raw)[keep].astype(np.int32)
+    rec_raw, rec = y_raw.sum() / max(n_true.sum(), 1), y.sum() / max(n_true.sum(), 1)
+    log(f"  recall: blocking {rec_raw:.4f}, after prefilter {rec:.4f}; {len(cands):,} pairs ({time.time() - t0:.0f}s)")
+    X = pair_features(cands, s1p, s23p, workers=-1)
+    log(f"  pair features {X.shape} ({time.time() - t0:.0f}s)")
+    model = train_two_stage(cands, X, y, n_true, s23p, seed=seed, log=log)
+    model.update(prefilter=pf, recall_blocking=float(rec_raw), recall_prefilter=float(rec), n_train_pairs=len(cands))
+    return model
+
+
 def predict_chunked(test_s1p, test_s23p, model, chunk_size=250_000, cache_dir="stage2_cache", log=print,
                     workers=-1):
     """Returns (cands, selected): DataFrames with global qi (into test_s1p) and di (into test_s23p)."""
@@ -379,6 +553,11 @@ def predict_chunked(test_s1p, test_s23p, model, chunk_size=250_000, cache_dir="s
         if len(cc) == 0:
             continue
         cs = test_s1p.iloc[qidx].reset_index(drop=True)
+        n_raw = len(cc)
+        cc = cc[apply_prefilter(cc, cs, test_s23p, model.get("prefilter"))].reset_index(drop=True)
+        if len(cc) == 0:
+            continue
+        cc = cc.reindex(columns=["qi", "di"] + BLK_COLS + ["n_blockers"])
         X = pair_features(cc, cs, test_s23p, workers=workers)
         p1 = clf1.predict_proba(X)[:, 1].astype(np.float32)
         cc = cc[["qi", "di"]].copy()
@@ -387,11 +566,11 @@ def predict_chunked(test_s1p, test_s23p, model, chunk_size=250_000, cache_dir="s
         part = stage2_matrix(X, p1, G1, pd.DataFrame(index=cc.index))
         part = part.reindex(columns=[c for c in cols if c not in g23_cols])
         path = os.path.join(cache_dir, f"chunk{ci}.npy")
-        np.save(path, part.to_numpy(np.float16))
+        np.save(path, part.to_numpy(np.float32))
         chunks.append((path, list(part.columns), qidx[cc["qi"].to_numpy()].astype(np.int32),
                        cc["di"].to_numpy().astype(np.int32), p1))
-        log(f"  [pass 1] chunk {ci + 1}: {len(qidx):,} S1 ({cs['country'].iat[0]}), {len(cc):,} candidates "
-            f"({time.time() - t0:.0f}s)")
+        log(f"  [pass 1] chunk {ci + 1}: {len(qidx):,} S1 ({cs['country'].iat[0]}), {n_raw:,} blocked -> "
+            f"{len(cc):,} after prefilter ({time.time() - t0:.0f}s)")
         del cs, cc, X, G1, part
         gc.collect()
 
@@ -406,7 +585,7 @@ def predict_chunked(test_s1p, test_s23p, model, chunk_size=250_000, cache_dir="s
     off = 0
     for path, pcols, cqi, _, _ in chunks:
         n = len(cqi)
-        M = pd.DataFrame(np.load(path).astype(np.float32), columns=pcols)
+        M = pd.DataFrame(np.load(path), columns=pcols)
         for c in g23_cols:
             M[c] = G23[c].to_numpy()[off:off + n]
         score[off:off + n] = clf2.predict_proba(M[cols])[:, 1]

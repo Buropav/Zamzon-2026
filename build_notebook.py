@@ -45,18 +45,20 @@ from src.er_lexicon import embed as _embed_resources  # noqa: E402
 # Title
 md("""
 # Amazon ML Challenge 2026: Business Entity Resolution
-### Multilingual Normalization + Static Lexicon, Multi-View Blocking, Two-Stage GBDT (XGBoost on GPU)
+### Learned transliteration, forward + reverse + exact-key blocking, GBDT prefilter, two-stage GBDT (XGBoost on GPU)
 
 **Pipeline**:
 - **Data**: read directly from the attached Kaggle dataset (`/kaggle/input/...`), no downloads.
-- **Normalisation**: all major Indic scripts + Urdu romanised, French ligatures/apostrophes, legal forms, landmarks,
-  PIN/ZIP parsing, plus a static per-country lexicon (Indic-script English loanwords, abbreviations, state codes,
-  typos, OCR digit noise) embedded in cell 7. Built offline once; no API is called here.
-- **Training data**: every record of whole regions (density preserved), split 60/20/20 by Source 1.
-- **Blocking**: 3-view country-partitioned char TF-IDF; vectorisers fitted once per country.
-- **Matching**: stage-1 GBDT on pair features -> stage-2 GBDT with group context (out-of-fold); XGBoost on GPU, LightGBM on CPU-only machines.
+- **Normalisation**: native-script names mapped word-for-word to Latin with a dictionary learned from the training
+  ground truth; all Indic scripts + Urdu romanised otherwise; French ligatures/apostrophes, legal forms, landmarks,
+  PIN/ZIP parsing, static per-country lexicon (cell 7). No API is called here.
+- **Training data**: every record of 10 whole regions (density preserved), split 60/20/20 by Source 1.
+- **Blocking** per (country, state/region): char TF-IDF top-k forward (name, core name, name+address, address),
+  reverse (each Source 2/3 record -> its best Source 1 records), and exact keys (house number + name).
+- **Prefilter**: small GBDT on blocking similarities + fast features drops ~90% of candidates, keeps ~99.98% of true pairs.
+- **Matching**: stage-1 GBDT on pair features (incl. address-number alignment that separates the generator's decoys
+  from true copies) -> stage-2 GBDT with group context (out-of-fold); XGBoost on GPU, LightGBM on CPU-only machines.
 - **Selection**: two thresholds (tau1, tau2) tuned on Macro F0.5, globally one-to-one.
-- **Inference**: Source 1 chunks, stage-2 inputs cached on disk (float16), all 1.73M Source 1 rows written.
 
 Set `DEV_MODE = True` in the config cell for a quick sanity run.
 """)
@@ -205,8 +207,9 @@ print("Lexicon loaded:", {{c: len(v["tok"]["name"]) + len(v["tok"]["addr"]) + le
       "| token classes:", len(_LEX["token_class"]), "| conflict pairs:", len(_LEX["conflicts"]))
 """)
 
-# Cell 8: Scalable Country-Partitioned Blocking
-code(inline("blocking.py"))
+# Cell 8: Scalable Country-Partitioned Blocking; native-script map learned from training pairs; generator-aware
+# pair features (address-number alignment, compact names, token differences)
+code(inline("blocking.py") + "\n\n\n" + inline("translit.py") + "\n\n\n" + inline("extra_feats.py"))
 
 # Cell 9: Region keys (state / region) for regional blocking, then unified feature engineering
 code(inline("geo.py") + "\n\n\n" + inline("features.py"))
@@ -230,6 +233,11 @@ T0 = time.time()
 TRAIN_REGIONS = ("PUNJAB",) if DEV_MODE else DEFAULT_REGIONS
 print("Loading training data...")
 s1 = read_tsv(train_s1_path); s2 = read_tsv(train_s2_path); s3 = read_tsv(train_s3_path); gt = read_tsv(train_gt_path)
+# word-for-word native-script -> Latin map, learned from ALL training ground-truth pairs (training data only)
+NATIVE_MAP = native_map_from_frames(s1, pd.concat([s2, s3], ignore_index=True), gt)
+print(f"Native-script map: {len(NATIVE_MAP['name']):,} name words, {len(NATIVE_MAP['addr'])} address components ({time.time()-T0:.0f}s)")
+# Source 1 name vocabulary (full table, like the full test Source 1 at inference)
+NAME_VOCAB = build_vocab(re.sub(r"[^a-z0-9]+", " ", str(x).lower()) for x in s1["business_name"])
 s1, s23, gt = region_sample(s1, s2, s3, gt, TRAIN_REGIONS)
 del s2, s3; gc.collect()
 gt_dict = parse_gt(gt)
@@ -244,15 +252,13 @@ cands = block_candidates(s1p, s23p, log=print)
 s1_ids, s23_ids = s1p["entity_id"].to_numpy(), s23p["entity_id"].to_numpy()
 labels = np.array([s23_ids[d] in gt_dict.get(s1_ids[q], ()) for q, d in zip(cands.qi, cands.di)], np.int32)
 n_true = np.array([len(gt_dict.get(e, ())) for e in s1_ids])
-recall = labels.sum() / max(n_true.sum(), 1)
-print(f"Candidates: {len(cands):,}  blocking recall: {recall*100:.2f}%  ({time.time()-T0:.0f}s)")
+print(f"Blocked: {len(cands):,} pairs ({len(cands)/max(len(s1p),1):.1f} per Source 1)  ({time.time()-T0:.0f}s)")
 
-X_train = pair_features(cands, s1p, s23p, workers=-1)
-print(f"Feature matrix: {X_train.shape}  ({time.time()-T0:.0f}s)")
-model = train_two_stage(cands, X_train, labels, n_true, s23p)
+model = fit_pipeline(cands, s1p, s23p, labels, n_true)   # prefilter -> pair features -> two-stage GBDT
+recall = model["recall_prefilter"]
 best_f05, t1, t2 = model["f05_test"], model["t1"], model["t2"]
 print("Top stage-2 features:", ", ".join(model["stage2_importance"].head(10).index))
-del X_train, cands, s1p, s23p, s1, s23, gt; gc.collect()
+del cands, s1p, s23p, s1, s23, gt; gc.collect()
 print(f"Training done in {time.time()-T0:.0f}s")
 """)
 
@@ -269,6 +275,7 @@ del test_s2, test_s3; gc.collect()
 print(f"Test: S1={len(test_s1):,}, S23={len(test_s23):,}")
 print("Countries:", test_s1["country"].value_counts().to_dict())
 
+NAME_VOCAB = build_vocab(re.sub(r"[^a-z0-9]+", " ", str(x).lower()) for x in test_s1["business_name"])
 SLIM = ("business_name", "business_address", "ml_addr")   # raw text not needed after cleaning
 test_s1p = prepare_side(test_s1, drop=SLIM)
 test_s23p = prepare_side(test_s23, drop=SLIM)
@@ -305,7 +312,9 @@ metrics_data = {
     "heldout_macro_f05_two_stage": round(float(model["f05_test"]), 4),
     "heldout_macro_f05_stage1_only": round(float(model["f05_test_stage1"]), 4),
     "tau1": round(float(t1), 2), "tau2": round(float(t2), 2),
-    "train_blocking_recall": round(float(recall), 4),
+    "train_blocking_recall": round(float(model["recall_blocking"]), 4),
+    "train_recall_after_prefilter": round(float(model["recall_prefilter"]), 4),
+    "train_pairs_after_prefilter": int(model["n_train_pairs"]),
     "train_regions": list(TRAIN_REGIONS),
     "model_backend": resolve_backend(), "gpu_blocking": _gpu() is not None,
     "test_s1_count": len(test_s1), "test_candidate_pairs": int(len(test_cands)), "test_matches": int(len(test_sel)),
@@ -320,37 +329,39 @@ methodology_content = f\"\"\"# Business Entity Resolution - Methodology
 ### Team: zamzon_ai
 
 ## Summary
-Multilingual normalisation with an offline-built static lexicon, 3-view country-partitioned TF-IDF
-blocking, a two-stage {_backend_name} matcher (pair features, then group context) and a two-threshold,
-globally one-to-one selection. Held-out Macro F0.5 on whole training regions: **{model['f05_test']:.4f}**
-(stage 1 alone: {model['f05_test_stage1']:.4f}); training blocking recall {recall*100:.2f}%.
+Learned native-script transliteration + multilingual normalisation, forward + reverse + exact-key blocking per
+(country, region), a GBDT prefilter, a two-stage {_backend_name} matcher (pair features incl. address-number
+alignment, then group context) and a two-threshold, globally one-to-one selection. Held-out Macro F0.5 on whole
+training regions: **{model['f05_test']:.4f}** (stage 1 alone: {model['f05_test_stage1']:.4f}); training recall
+after blocking {model['recall_blocking']*100:.2f}%, after the prefilter {model['recall_prefilter']*100:.2f}%.
 
 ## 1. Normalisation
-- Every Indic script + Urdu romanised (no names wiped), French ligatures/apostrophes handled, legal forms,
-  street types, landmarks (near/opp/ke paas/en face de), PIN/ZIP parsing.
-- Static lexicon (src/resources/*.tsv), applied per country (unknown countries use the script-level part):
-  English words written in Indic scripts (kansaltents->consultants), abbreviations (r->rue, mh->maharashtra,
-  state codes), state/phrase variants (tamil nadu->tn), frequent typos, OCR digit noise (hea1th->health),
-  junk address tokens (null, na, pmb).
-- The lexicon was built once, offline, from word statistics: candidates from training ground-truth swaps and
-  vocabulary counts, judged word-by-word by an evaluation model (TypeSafe Jev). It only saw single words or
-  short phrases, never a record, and never decided whether two businesses match. It is not called at run
-  time; the pipeline reads static TSV files. Every rule was checked against training labels where they exist.
+- Native-script Source 2/3 names are word-for-word transliterations of the Source 1 name (same token count in
+  99.99% of training pairs), so a word map learned from the training ground truth (1.3k words, 98.9% purity,
+  96% token coverage of test native-script names) turns them back into the English words; state names written
+  in native script map to their Latin component. Unmapped words fall back to rule-based romanisation.
+- Legal forms, street types, landmarks, PIN/ZIP parsing, French ligatures/apostrophes, static per-country lexicon.
 
 ## 2. Blocking
-Country-partitioned char 3-4gram TF-IDF (max_df=0.01, sparse products on the GPU via CuPy when available) on name (top 25), core name (top 15) and
-name+address (top 20); union. Vectorisers are fitted once per country on Source 2/3.
-Test: {len(test_cands):,} candidate pairs for {len(test_s1):,} Source 1 entities.
+Per (country, state/region) pool (US state read from whole address components, so OR/IN/ME/OK are recognised):
+char 3-4gram TF-IDF top-k forward (name 30, core name 15, name+address 50, address 20), reverse (each Source 2/3
+record -> its top Source 1 records: name+address 3, name 2, address 2) and exact keys (house number + name-word
+prefix, house number + compact name). On a test-sized Indian pool (Karnataka) recall rose from 0.940 (old
+3-view forward blocking) to 0.982. A small GBDT prefilter on blocking similarities and fast features then keeps
+~10% of the candidates and ~99.98% of the true pairs.
+Test: {len(test_cands):,} candidate pairs (after the prefilter) for {len(test_s1):,} Source 1 entities.
 
 ## 3. Matching model
-- Stage 1: {_backend_name} on ~57 pair features (fuzzy name/core/address ratios, IDF cosines, postcode / house /
-  unit agreement, phonetic keys, DBA and landmark handling, distinctive-word similarity, look-alike name
-  conflict flag, blocker similarities).
+- Stage 1: {_backend_name} on ~88 pair features: fuzzy name/core/address ratios, IDF cosines, phonetic keys,
+  DBA/landmark handling, distinctive-word similarity, blocking similarities, and generator-aware features:
+  address-number alignment (exact / small shift / one-digit typo / truncation - decoy records are near-copies of
+  a Source 1 record with the house number shifted by a few units), compact-name similarity (domain / handle
+  names), and word-difference classes (typo vs substituted real word vs unknown brand word).
 - Stage 2: {_backend_name} on the stage-1 score plus group context: rank and margin inside the Source 1 group and
-  among all Source 1 entities competing for the same Source 2/3 record, similarity to the best other
-  candidate, same-address support. Stage-1 scores for stage-2 training are out-of-fold.
-- Training data: every record of whole regions ({', '.join(TRAIN_REGIONS)}) to keep test-like density.
-  Split by Source 1: 60% fit / 20% early stopping + threshold tuning / 20% held-out report.
+  among all Source 1 entities competing for the same Source 2/3 record, similarity to the best other candidate,
+  support from other candidates at the same address / with the same house number. Out-of-fold stage-1 scores.
+- Training data: every record of whole regions ({', '.join(TRAIN_REGIONS)}); split by Source 1:
+  60% fit / 20% early stopping + threshold tuning / 20% held-out report.
 
 ## 4. Decision policy
 tau1 = {t1:.2f} (best candidate), tau2 = {t2:.2f} (additional candidates); each Source 2/3 record is assigned

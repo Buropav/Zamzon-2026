@@ -13,12 +13,17 @@ from . import er_multilingual as _ML
 from .er_multilingual import ml_pair_features
 from .er_lexicon import load_default, country_aware, country_key, distinct_tokens, name_conflict
 from .geo import region_key
+from .extra_feats import (addr_numbers, num_matrix, num_features, compact, compact_features, token_features,
+                          NUM_COLS, CMP_COLS, TOK_COLS)
+from .translit import apply_frame
 _LEX = load_default()
 prepare_ml = country_aware(_ML.prepare_ml, vars(_ML), _LEX)
 # </package-only>
 
 _PC = re.compile(r"\d{5,6}")
 _NUM = re.compile(r"\d+")
+NATIVE_MAP = None   # native-script -> Latin map learned from training pairs (translit.native_map_from_frames)
+NAME_VOCAB = None   # Source 1 name vocabulary of the current table (extra_feats.build_vocab)
 
 def _first(rx, s):
     m = rx.search(str(s))
@@ -189,7 +194,7 @@ def _fork_map(fn, items, n):
 
 def _prepare_rows(df, drop=()):
     """All per-row work of prepare_side (everything except the table-level core frequency)."""
-    df = df.copy()
+    df = apply_frame(df, NATIVE_MAP) if NATIVE_MAP else df.copy()
     ml_cols = prepare_ml(df, name_col="business_name", addr_col="business_address")
     for col in ml_cols.columns:
         df[col] = ml_cols[col]
@@ -202,7 +207,9 @@ def _prepare_rows(df, drop=()):
     df["nums"] = df["norm_addr"].map(lambda s: frozenset(_NUM.findall(str(s))))
     df["ckey"] = df["country"].map(country_key)
     df["distinct"] = [" ".join(distinct_tokens(n, _LEX, c)) for n, c in zip(df["norm_name"], df["ckey"])]
-    df["region"] = [region_key(c, a) for c, a in zip(df["country"], df["ml_addr"])]
+    df["region"] = [region_key(c, a, r) for c, a, r in zip(df["country"], df["ml_addr"], df["business_address"])]
+    df["addr_nums"] = [addr_numbers(a) for a in df["ml_addr"]]
+    df["compact"] = [compact(n) for n in df["norm_name"]]
     _share_objects(df)
     return df.drop(columns=list(drop), errors="ignore")
 
@@ -239,7 +246,10 @@ def prepare_side(df, drop=(), n_jobs=None):
                 out[col] = [cache.setdefault(v, v) for v in out[col]]
     else:
         out = _prepare_rows(df, drop)
-    out["core_freq"] = out.groupby(["country", "core"])["core"].transform("size").astype(np.float32)
+    # records with the same core name per 100k records of the country: a rate, so a region-sized training table
+    # and the full test table give comparable values
+    n_ctry = out.groupby("country")["core"].transform("size")
+    out["core_freq"] = (out.groupby(["country", "core"])["core"].transform("size") / n_ctry * 1e5).astype(np.float32)
     return out
 
 
@@ -320,6 +330,12 @@ def _pair_features(cand, s1, s23, workers=-1, idfcos=True):
         if col not in F.columns:
             F[col] = F_ml[col].to_numpy(np.float32)
 
+    # Address-number alignment (decoy house-number shifts vs copy typos), compact names, token differences
+    F_x = pd.concat([num_features(num_matrix(s1["addr_nums"].to_numpy()), num_matrix(s23["addr_nums"].to_numpy()), qi, di),
+                     compact_features(s1["compact"].to_numpy()[qi], s23["compact"].to_numpy()[di], workers=workers),
+                     token_features(xa, xb, NAME_VOCAB)], axis=1)
+    for col in F_x.columns:
+        F[col] = F_x[col].to_numpy(np.float32)
     return F
 
 

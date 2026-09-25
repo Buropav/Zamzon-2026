@@ -81,12 +81,42 @@ _IDX["FRANCE"]["calais"] = {"HDF"}
 _US_RX = [(k, re.compile(rf"(?<!\S)(?:{v})(?!\S)")) for k, v in _US_PHRASES.items()]
 
 
-def region_key(country, norm_addr):
+_US_NAMES = {}
+for _k, _v in _US.items():
+    for _w in _v.split():
+        if len(_w) > 2:
+            _US_NAMES[_w] = _k
+for _k, _v in _US_PHRASES.items():
+    for _w in _v.split("|"):
+        _US_NAMES[_w] = _k
+
+
+def _us_components(raw_addr):
+    """US state from whole comma-separated components of the RAW address: 'OR', 'Oregon', 'North Carolina'.
+    Two-letter codes that are also English words (OR, IN, ME, OK, HI, ...) are only trusted this way."""
+    found = set()
+    for comp in str(raw_addr).split(","):
+        c = comp.strip()
+        if len(c) == 2 and c.isalpha() and c.upper() in _US:
+            found.add(c.upper())
+        else:
+            k = _US_NAMES.get(re.sub(r"[^a-z ]", "", c.lower()).strip())
+            if k:
+                found.add(k)
+    return found
+
+
+def region_key(country, norm_addr, raw_addr=None):
     """'' when the region is unknown or ambiguous."""
     idx = _IDX.get(country)
     if not idx or not norm_addr:
         return ""
     found = set()
+    if country == "US" and raw_addr:
+        found = _us_components(raw_addr)
+        if len(found) == 1:
+            return next(iter(found))
+        found = set()
     if country == "US":
         for k, rx in _US_RX:
             if rx.search(norm_addr):

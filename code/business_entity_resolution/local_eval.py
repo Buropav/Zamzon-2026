@@ -30,7 +30,6 @@ from src.metrics import parse_gt, macro_f05, select_matches  # noqa: E402
 
 REGIONS = {"US": re.compile(r",\s*(OR|Oregon)\s*$", re.I),
            "India": re.compile(r"kerala|,\s*KL\b|കേരളം", re.I)}
-NEW_FEATURES = ["distinct_tset", "distinct_jacc", "name_conflict"]
 
 
 def load_slice(train_dir):
@@ -72,25 +71,24 @@ def set_mode(mode):
 
 
 def run(mode, train_dir, backend="lgbm", seed=42):
-    """Same code path as the notebook: block_candidates -> pair_features -> train_two_stage."""
+    """Same code path as the notebook: block_candidates -> fit_pipeline (prefilter, pair features, two stages)."""
     import src.two_stage as T
+    from src.extra_feats import build_vocab
     T.BACKEND = backend
     t0 = time.time()
     set_mode(mode)
     s1, s23, gt = load_slice(train_dir)
     gt_dict = parse_gt(gt)
+    FE.NAME_VOCAB = build_vocab(re.sub(r"[^a-z0-9]+", " ", str(x).lower()) for x in s1["business_name"])
     s1p, s23p = FE.prepare_side(s1), FE.prepare_side(s23)
     cands = T.block_candidates(s1p, s23p)
     s1_ids, s23_ids = s1p.entity_id.to_numpy(), s23p.entity_id.to_numpy()
     y = np.array([s23_ids[d] in gt_dict.get(s1_ids[q], ()) for q, d in zip(cands.qi, cands.di)], np.int32)
     n_true = np.array([len(gt_dict.get(e, ())) for e in s1_ids])
-    X = FE.pair_features(cands, s1p, s23p, workers=-1)
-    if mode.startswith("baseline"):
-        X = X.drop(columns=[c for c in NEW_FEATURES if c in X.columns])
     print(f"[{mode}/{backend}] S1={len(s1p):,} candidates={len(cands):,} recall={y.sum() / n_true.sum():.4f} "
-          f"features {X.shape} ({time.time() - t0:.0f}s)", flush=True)
+          f"({time.time() - t0:.0f}s)", flush=True)
     t1 = time.time()
-    m = T.train_two_stage(cands, X, y, n_true, s23p, seed=seed)
+    m = T.fit_pipeline(cands, s1p, s23p, y, n_true, seed=seed)
     ctry = s1p.country.to_numpy()
     part, c = m["part"], m["pairs"]
     sel = select_matches(c[part[c.qi.to_numpy()] == 2], "score", m["t1"], m["t2"], one_to_one=True)

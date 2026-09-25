@@ -14,12 +14,12 @@ import re
 import pandas as pd
 
 REGION_PATTERNS = {
-    # US: trailing state code or name
-    "OR": ("US", r",\s*(?:OR|Oregon)\s*$"),
-    "KY": ("US", r",\s*(?:KY|Kentucky)\s*$"),
-    "AR": ("US", r",\s*(?:AR|Arkansas)\s*$"),
-    "MO": ("US", r",\s*(?:MO|Missouri)\s*$"),
-    "WI": ("US", r",\s*(?:WI|Wisconsin)\s*$"),
+    # US: state code or name as a whole comma-separated component (any position)
+    "OR": ("US", r"(?:^|,)\s*(?:OR|Oregon)\s*(?:,|$)"),
+    "KY": ("US", r"(?:^|,)\s*(?:KY|Kentucky)\s*(?:,|$)"),
+    "AR": ("US", r"(?:^|,)\s*(?:AR|Arkansas)\s*(?:,|$)"),
+    "MO": ("US", r"(?:^|,)\s*(?:MO|Missouri)\s*(?:,|$)"),
+    "WI": ("US", r"(?:^|,)\s*(?:WI|Wisconsin)\s*(?:,|$)"),
     # India: state names, codes and native-script names anywhere in the address
     "KERALA": ("India", r"kerala|,\s*KL\b|കേരളം"),
     "PUNJAB": ("India", r"punjab|panjab|,\s*PB\b|ਪੰਜਾਬ"),
@@ -27,7 +27,7 @@ REGION_PATTERNS = {
     "ORISSA": ("India", r"orissa|odisha|,\s*OD\b|ଓଡ଼ିଶା"),
     "RAJASTHAN": ("India", r"rajasthan|,\s*RJ\b|राजस्थान"),
 }
-DEFAULT_REGIONS = ("OR", "KY", "AR", "KERALA", "PUNJAB", "HARYANA")
+DEFAULT_REGIONS = ("OR", "KY", "AR", "MO", "WI", "KERALA", "PUNJAB", "HARYANA", "ORISSA", "RAJASTHAN")
 
 
 def _mask(df, regions):
