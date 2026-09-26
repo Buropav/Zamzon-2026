@@ -28,7 +28,7 @@ sys.path.insert(0, str(HERE))
 
 from src.safe_io import read_tsv  # noqa: E402
 import src.features as FE  # noqa: E402
-from src.features import prepare_side  # noqa: E402
+from src.features import prepare_files, prepare_side  # noqa: E402
 from src.extra_feats import build_vocab  # noqa: E402
 from src.translit import native_map_from_frames  # noqa: E402
 from src.metrics import parse_gt, gt_diagnostics  # noqa: E402
@@ -94,7 +94,7 @@ def main(a):
     del ts1, ts23
     release_memory()
     slim = ("business_name", "business_address", "ml_addr")
-    cands, sel = predict_by_country(parts, model, lambda df: prepare_side(df, drop=slim), chunk_size=a.chunk_size,
+    cands, sel = predict_by_country(parts, model, lambda files: prepare_files(files, drop=slim), chunk_size=a.chunk_size,
                                     cache_dir=str(out_dir.parent / "stage2_cache"),
                                     block_budget_s=a.block_budget_min * 60, log=log)
     shutil.rmtree(spill, ignore_errors=True)

@@ -344,7 +344,7 @@ TEST_BLOCK_BUDGET_S = 3 * 3600
 CHUNK_SIZE = 1_000 if DEV_MODE else 100_000   # Source 1 per chunk (bounds peak memory of the prefilter features)
 make_gn = (lambda s1p_, s23p_: GlobalNames(s1p_["norm_name"].to_numpy(object), s1p_["country"].to_numpy(object), s23p_,
                                             lambda Q, DT, k, ms: _topk_any(Q, DT, k, ms, _gpu())))
-test_cands, test_sel = predict_by_country(TEST_PARTS, model, lambda df: prepare_side(df, drop=SLIM),
+test_cands, test_sel = predict_by_country(TEST_PARTS, model, lambda files: prepare_files(files, drop=SLIM),
                                           chunk_size=CHUNK_SIZE, cache_dir=str(WORKING_DIR / "stage2_cache"),
                                           block_budget_s=TEST_BLOCK_BUDGET_S, make_gnames=make_gn)
 shutil.rmtree(WORKING_DIR / "test_by_country", ignore_errors=True)

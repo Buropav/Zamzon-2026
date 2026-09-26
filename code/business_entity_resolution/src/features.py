@@ -262,24 +262,45 @@ def _prepare_rows_task(args):
     return _prepare_rows(*args)
 
 
+def _prepare_file_task(args):
+    path, drop = args
+    return _prepare_rows(pd.read_pickle(path), drop)
+
+
+def _finish_prepared(parts):
+    """Joins prepared parts and adds the table-level core-name frequency."""
+    out = pd.concat(parts) if len(parts) > 1 else parts[0]
+    parts.clear()  # the caller's list too: frees the parts' column arrays now
+    for col in ("nums", "ml_name_nums"):  # share identical sets across worker parts too
+        if col in out:
+            cache = {}
+            out[col] = [cache.setdefault(v, v) for v in out[col]]
+    # records with the same core name per 100k records of the country: a rate, so a region-sized training table
+    # and the full test table give comparable values
+    n_ctry = out.groupby("country")["core"].transform("size")
+    out["core_freq"] = (out.groupby(["country", "core"])["core"].transform("size") / n_ctry * 1e5).astype(np.float32)
+    return out
+
+
 def prepare_side(df, drop=(), n_jobs=None):
     """Precomputes side-level metadata, multilingual representations, and chain frequencies.
     Runs on all CPU cores for large tables. `drop` removes raw columns afterwards (saves memory)."""
     n = n_jobs or N_JOBS
     if n > 1 and len(df) >= 40_000:
         parts = np.array_split(np.arange(len(df)), n * 4)
-        out = pd.concat(_fork_map(_prepare_rows_task, _Lazy(len(parts), lambda i: (df.iloc[parts[i]], tuple(drop))), n))
-        for col in ("nums", "ml_name_nums"):  # share identical sets across worker parts too
-            if col in out:
-                cache = {}
-                out[col] = [cache.setdefault(v, v) for v in out[col]]
-    else:
-        out = _prepare_rows(df, drop)
-    # records with the same core name per 100k records of the country: a rate, so a region-sized training table
-    # and the full test table give comparable values
-    n_ctry = out.groupby("country")["core"].transform("size")
-    out["core_freq"] = (out.groupby(["country", "core"])["core"].transform("size") / n_ctry * 1e5).astype(np.float32)
-    return out
+        return _finish_prepared(_fork_map(_prepare_rows_task,
+                                          _Lazy(len(parts), lambda i: (df.iloc[parts[i]], tuple(drop))), n))
+    return _finish_prepared([_prepare_rows(df, drop)])
+
+
+def prepare_files(paths, drop=(), n_jobs=None):
+    """prepare_side of a table stored as pickled row blocks (one task per file): the raw rows are loaded by the
+    workers only, so the parent never holds them next to the prepared table. Rows keep the files' order; the
+    index is reset to positions."""
+    n = n_jobs or N_JOBS
+    items = [(p, tuple(drop)) for p in paths]
+    parts = _fork_map(_prepare_file_task, items, n) if n > 1 and len(items) > 1 else [_prepare_file_task(x) for x in items]
+    return _finish_prepared(parts).reset_index(drop=True)
 
 
 def _pair_features(cand, s1, s23, workers=-1, idfcos=True):

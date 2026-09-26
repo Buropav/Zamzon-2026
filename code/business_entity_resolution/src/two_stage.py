@@ -19,7 +19,7 @@ globally; pass 2 applies stage 2 chunk by chunk; selection is global.
 """
 # <package-only>
 from .blocking import _topk_rows, union_candidates
-from .features import pair_features, _TFIDF_CACHE
+from .features import pair_features, _TFIDF_CACHE, _fork_map, N_JOBS
 from .extra_feats import num_matrix, num_features
 from .global_names import GN_COLS
 from .groups import s1_side_features, s23_side_features, stage2_matrix
@@ -33,9 +33,11 @@ import time
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 from rapidfuzz import fuzz
 from rapidfuzz.process import cpdist
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.preprocessing import normalize
 
 LGB_PARAMS = dict(n_estimators=1500, learning_rate=0.05, num_leaves=63, subsample=0.8, subsample_freq=1,
                   colsample_bytree=0.8, min_child_samples=40, random_state=42, n_jobs=-1, verbose=-1)
@@ -77,6 +79,86 @@ def _view(p, name):
     if name == "addr":
         return p["norm_addr"].to_numpy(object)
     return (p["norm_name"] + " " + p["norm_addr"]).to_numpy(object)
+
+
+TFIDF_BATCH = int(os.environ.get("ER_TFIDF_BATCH", "200000"))  # documents per task of the batched TF-IDF
+
+
+def _char_counter(vocabulary=None):
+    return CountVectorizer(analyzer="char_wb", ngram_range=(3, 4), vocabulary=vocabulary, dtype=np.float32)
+
+
+def _df_task(docs):
+    """Document frequency of every char n-gram in one batch -> (n-grams, counts)."""
+    cv = _char_counter()
+    try:
+        X = cv.fit_transform(docs)
+    except ValueError:  # every document empty
+        return np.array([], object), np.array([], np.int64)
+    return cv.get_feature_names_out().astype(object), np.diff(X.tocsc().indptr).astype(np.int64)
+
+
+class BatchedTfidf:
+    """TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4), min_df, max_df, sublinear_tf=True, float32),
+    computed in document batches on all CPU cores: document frequencies batch by batch, then the vocabulary /
+    smooth idf of the whole input, then sublinear tf x idf with l2 rows per batch. Same matrix as fit_transform,
+    without its peak (~1.7 kB per document on name+address, ~8 GB for India's 4.7M Source 2/3 records; the
+    finished matrix is ~0.3 kB per document)."""
+
+    def __init__(self, min_df=2, max_df=1.0, batch=None, n_jobs=None):
+        self.min_df, self.max_df = min_df, max_df
+        self.batch, self.n_jobs = batch or TFIDF_BATCH, n_jobs or N_JOBS
+
+    def _map(self, fn, docs):
+        """fn over document batches, N_JOBS batches at a time (bounded memory), results in order."""
+        batches = [docs[i:i + self.batch] for i in range(0, len(docs), self.batch)]
+        if self.n_jobs <= 1 or len(batches) <= 1:
+            for b in batches:
+                yield fn(b)
+            return
+        step = 2 * self.n_jobs
+        for g in range(0, len(batches), step):
+            yield from _fork_map(fn, batches[g:g + step], self.n_jobs)
+
+    def fit_transform(self, docs):
+        df = {}
+        for names, cnt in self._map(_df_task, docs):
+            get = df.get
+            for t, c in zip(names.tolist(), cnt.tolist()):
+                df[t] = get(t, 0) + c
+        n = len(docs)
+        hi = self.max_df if isinstance(self.max_df, (int, np.integer)) else self.max_df * n
+        lo = self.min_df if isinstance(self.min_df, (int, np.integer)) else self.min_df * n
+        terms = sorted(t for t, c in df.items() if lo <= c <= hi)
+        if not terms:
+            raise ValueError("no n-gram left after min_df / max_df")
+        dfa = np.fromiter((df[t] for t in terms), np.float64, len(terms))
+        del df
+        self.vocabulary_ = {t: i for i, t in enumerate(terms)}
+        self.idf_ = (np.log((1.0 + n) / (1.0 + dfa)) + 1.0).astype(np.float32)
+        return self.transform(docs)
+
+    def transform(self, docs):
+        cv, idf = _char_counter(self.vocabulary_), self.idf_
+
+        def task(b):
+            X = cv.transform(b).tocsr()
+            np.log(X.data, X.data)
+            X.data += 1.0
+            X.data *= idf[X.indices]
+            return normalize(X, norm="l2", copy=False).astype(np.float32)
+
+        parts = list(self._map(task, docs))
+        nnz = sum(p.nnz for p in parts)
+        data, indices = np.empty(nnz, np.float32), np.empty(nnz, np.int32)
+        indptr, o, r = np.zeros(len(docs) + 1, np.int64), 0, 0
+        for k in range(len(parts)):  # fill the final arrays part by part, freeing each part (peak ~ 1 matrix)
+            p, parts[k] = parts[k], None
+            data[o:o + p.nnz], indices[o:o + p.nnz] = p.data, p.indices
+            indptr[r + 1:r + 1 + p.shape[0]] = p.indptr[1:] + o
+            o, r = o + p.nnz, r + p.shape[0]
+            del p
+        return sp.csr_matrix((data, indices, indptr), shape=(len(docs), len(self.vocabulary_)))
 
 
 def _topk_cpu(Q, DT, k, min_sim, batch=2000):
@@ -264,13 +346,12 @@ def _country_block(qp, dp, g, groups, gpu, min_sim, max_df, log=None):
     fwd, rev = dict(BLOCKERS), dict(REVERSE)
     for name in list(dict.fromkeys(list(fwd) + list(rev))):
         t = time.time()
-        vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4), min_df=2, max_df=mdf,
-                              sublinear_tf=True, dtype=np.float32)
+        vec = BatchedTfidf(min_df=2, max_df=mdf)
         try:
-            D = vec.fit_transform(_view(dp.iloc[d_c], name)).tocsr()
+            D = vec.fit_transform(_view(dp.iloc[d_c], name))
         except ValueError:  # tiny pool: no n-gram survives min_df/max_df
             continue
-        Q = vec.transform(_view(qp.iloc[q_c], name)).tocsr()
+        Q = vec.transform(_view(qp.iloc[q_c], name))
         t_fit = time.time() - t
         for lab, q_idx, d_idx in groups:
             region = lab.split("/", 1)[1]
@@ -801,22 +882,32 @@ def mem_info():
     return " | ".join(x for x in (rss, box) if x) or "RAM n/a"
 
 
+SPILL_ROWS = 100_000  # raw rows per file set aside by split_by_country (one preparation task each)
+
+
 def split_by_country(s1, s23, spill_dir, log=print):
-    """Writes each country's raw Source 1 / Source 2/3 rows to spill_dir, largest country first, so that test
-    inference holds ONE country in memory at a time (the full test set prepared at once needs ~20 GB on top of
-    the raw tables). Source 2/3 rows without a country join every country, as in the blocking pools.
-    -> [(country, Source 1 positions, Source 2/3 positions, Source 1 file, Source 2/3 file)]"""
+    """Writes each country's raw Source 1 / Source 2/3 rows to spill_dir in blocks of SPILL_ROWS, largest country
+    first, so that test inference holds ONE country in memory at a time and the raw rows are only ever loaded by
+    the preparation workers (the whole test set prepared at once needs ~20 GB on top of the raw tables).
+    Source 2/3 rows without a country join every country, as in the blocking pools.
+    -> [(country, Source 1 positions, Source 2/3 positions, Source 1 files, Source 2/3 files)]"""
     os.makedirs(spill_dir, exist_ok=True)
     c1 = s1["country"].map(canon_country).to_numpy(object)
     c23 = s23["country"].map(canon_country).to_numpy(object)
     out = []
+
+    def spill(df, idx, tag):
+        files = []
+        for k in range(0, len(idx), SPILL_ROWS):
+            f = os.path.join(spill_dir, f"{tag}_{len(out)}_{k // SPILL_ROWS}.pkl")
+            df.iloc[idx[k:k + SPILL_ROWS]].to_pickle(f)
+            files.append(f)
+        return files
+
     for c in sorted(pd.unique(c1), key=lambda x: -(c1 == x).sum()):
         i1 = np.flatnonzero(c1 == c)
         i23 = np.arange(len(s23)) if c == "" else np.flatnonzero((c23 == c) | (c23 == ""))
-        f1, f23 = os.path.join(spill_dir, f"s1_{len(out)}.pkl"), os.path.join(spill_dir, f"s23_{len(out)}.pkl")
-        s1.iloc[i1].to_pickle(f1)
-        s23.iloc[i23].to_pickle(f23)
-        out.append((c, i1, i23, f1, f23))
+        out.append((c, i1, i23, spill(s1, i1, "s1"), spill(s23, i23, "s23")))
         log(f"  {c or '<no country>'}: {len(i1):,} S1, {len(i23):,} S2/S3 set aside")
     return out
 
@@ -825,7 +916,8 @@ def predict_by_country(parts, model, prepare, chunk_size=100_000, cache_dir="sta
                        make_gnames=None, log=print):
     """Test inference one country at a time (parts from split_by_country). Blocking pools, TF-IDF fits and
     group features never cross countries, so this scores the same pairs as a single pass; only the final
-    one-to-one selection runs over all countries together. prepare: raw table -> prepared table.
+    one-to-one selection runs over all countries together. prepare: list of raw row-block files -> prepared
+    table (features.prepare_files).
     block_budget_s: time budget for all test blocking; a country whose projected blocking time exceeds what is
     left (minus a reserve for the countries after it) drops optional views.
     Returns (cands, selected) with qi / di as positions in the ORIGINAL Source 1 / Source 2/3 tables."""
@@ -833,10 +925,9 @@ def predict_by_country(parts, model, prepare, chunk_size=100_000, cache_dir="sta
     t0, sec0 = time.time(), BLOCK_STATS["seconds"]
     for n, (c, i1, i23, f1, f23) in enumerate(parts):
         reset_blocking()
-        s1p = prepare(pd.read_pickle(f1))
-        os.remove(f1)
-        s23p = prepare(pd.read_pickle(f23))
-        os.remove(f23)
+        s1p, s23p = prepare(f1), prepare(f23)
+        for f in f1 + f23:
+            os.remove(f)
         release_memory()
         log(f"  {c}: prepared {len(s1p):,} S1 / {len(s23p):,} S2/S3 ({time.time() - t0:.0f}s, {mem_info()})")
         if block_budget_s:
