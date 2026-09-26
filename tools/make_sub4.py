@@ -21,12 +21,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import make_sub3a3 as s3  # noqa: E402
 
 WF = re.compile(r'^%%writefile "\{SRC_DIR\}/ber/(\w+\.py)"\n')
-ADDED_COLS = {"numfeat": 15, "hnum_ctx": 2, "native_map": 0, "fillers": 0}   # feature-matrix columns each part adds
+ADDED_COLS = {"numfeat": 15, "hnum_ctx": 2, "native_map": 0, "fillers": 0, "stateparse": 0, "flatkey": 0}   # feature-matrix columns each part adds
 DESCR = {
     "numfeat": "address-number alignment features (exact / small shift / one-digit typo / truncation, from the old pipeline)",
     "hnum_ctx": "same-house-number context in stage 2 (other candidates of the S1 sharing the house number)",
     "native_map": "native-script -> Latin word map learned from the TRAIN ground truth only",
     "fillers": "generator filler words (S2/S3-only words, e.g. French participations/holding/distribution) learned from the data and removed from core names; French et -> and, cie/compagnie -> co",
+    "stateparse": "state read from the record's own country, 2-letter code > exact name > phonetic, last one wins, never from a component with digits ('Fl 1' is a floor, not Florida); train pairs with conflicting states (unreachable by blocking): US 1.42% -> 0.03%, India 0.39% -> 0.03%",
+    "flatkey": "India: whole phonetic name as one more blocking token (native-script names transliterate to the same phonetic key as their S1 name); blocking misses on the OH+KA benchmark 4,158 -> 3,577 with stateparse",
 }
 
 
