@@ -9,3 +9,4 @@ S9|{"train_s1_frac": 1.0}|numfeat,hnum_ctx,fillers,stateparse,flatkey,translit,p
 S9lr03|{"train_s1_frac": 1.0, "xgb_params": {"learning_rate": 0.03}, "stage1_rounds": 6000, "stage2_rounds": 6000}|numfeat,hnum_ctx,fillers,stateparse,flatkey,translit,phonfix
 S9f5|{"train_s1_frac": 1.0, "n_folds": 5}|numfeat,hnum_ctx,fillers,stateparse,flatkey,translit,phonfix
 S9d12|{"train_s1_frac": 1.0, "xgb_params": {"learning_rate": 0.05, "max_depth": 12}}|numfeat,hnum_ctx,fillers,stateparse,flatkey,translit,phonfix
+S10|{"train_s1_frac": 1.0}|numfeat,hnum_ctx,fillers,stateparse,flatkey,translit,phonfix,memtrain,lowmem

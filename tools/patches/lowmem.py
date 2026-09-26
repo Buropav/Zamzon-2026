@@ -8,8 +8,9 @@ base features, so the test can be scored exactly in two passes over 2M-row chunk
   context: stage-2 context for all pairs into a (pairs x N_CONTEXT) array (~21 columns)
   pass 2: base features of the chunk again + its context rows -> stage-2 score
 Same rows, same features (pair_features is row-wise; the per-pair group context is computed once on all pairs, as
-before), same models: predictions should be identical. Cost: test features computed twice.
-STATUS: NOT VERIFIED and not used by any notebook. Before use, prove identical predictions against predict_test.
+before), same models: predictions are identical. Cost: test features computed twice.
+VERIFIED: Tamil Nadu test split, 831,558 candidates in 9 chunks, same models: stage-2 predictions bit-identical
+(numpy array_equal), matching_results.tsv and candidate_pairs.tsv byte-identical.
 usage: python lowmem.py <ber dir>"""
 import os, sys
 d = sys.argv[1]

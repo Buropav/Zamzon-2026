@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import make_sub3a3 as s3  # noqa: E402
 
 WF = re.compile(r'^%%writefile "\{SRC_DIR\}/ber/(\w+\.py)"\n')
-ADDED_COLS = {"numfeat": 15, "hnum_ctx": 2, "native_map": 0, "fillers": 0, "stateparse": 0, "flatkey": 0, "translit": 0, "phonfix": 0}   # feature-matrix columns each part adds
+ADDED_COLS = {"numfeat": 15, "hnum_ctx": 2, "native_map": 0, "fillers": 0, "stateparse": 0, "flatkey": 0, "translit": 0, "phonfix": 0, "memtrain": 0, "lowmem": 0}   # feature-matrix columns each part adds
 DESCR = {
     "numfeat": "address-number alignment features (exact / small shift / one-digit typo / truncation, from the old pipeline)",
     "hnum_ctx": "same-house-number context in stage 2 (other candidates of the S1 sharing the house number)",
@@ -31,6 +31,8 @@ DESCR = {
     "flatkey": "India: whole phonetic name as one more blocking token (native-script names transliterate to the same phonetic key as their S1 name); blocking misses on the OH+KA benchmark 4,158 -> 3,577 with stateparse",
     "translit": "Malayalam and Tamil romanisation fixes (Malayalam final consonants were dropped and its t written r; Tamil s/f read as ch/hp) and spelled-out LLP: native-script true pairs with equal phonetic names 59.6% -> 67.1% (Malayalam 2.3% -> 70.6%, Tamil 27.7% -> 56.6%)",
     "phonfix": "phonetic key follows English pronunciation where transliterations do (ventures ~ venchars, logistics ~ lojistiks, industries ~ indastrij, high ~ hai, new ~ nyu, infra ~ inphra, Bengali/Gurmukhi -ing): native-script true pairs with equal phonetic names 67.1% -> 85.0%",
+    "memtrain": "XGBoost trained from row indices in 1M-row chunks instead of copied row subsets (the copies killed the Kaggle run at stage 2): measured extra peak RAM 1.18x -> 0.65x of the feature matrix, identical model",
+    "lowmem": "test scored in two passes over 2M-row chunks instead of one ~15 GB matrix; predictions bit-identical (checked)",
 }
 
 
@@ -47,7 +49,7 @@ def main():
     # 1. erk_sub3a3's edits (training-fraction guard), with the options and column count for this build
     n_cols = 88 + sum(ADDED_COLS[p] for p in parts)
     num = re.sub(r"\D", "", Path(a.out).stem) or "4"
-    header = (f"# Amazon ML Challenge 2026 — Business Entity Resolution, submission {num} (big-RAM machine, e.g. AWS r6i.8xlarge)\n\n"
+    header = (f"# Amazon ML Challenge 2026 — Business Entity Resolution, submission {num} (Kaggle GPU T4 x2, 30 GiB RAM)\n\n"
               f"**Submission {num} = submission 2 (`erk_sub2_1`) + these changes:**\n"
               f"- training fraction: largest of {fracs} whose extra memory over 0.3 fits (see the `train_s1_frac` log lines)\n"
               + "".join(f"- {DESCR[p]}\n" for p in parts))
