@@ -1,0 +1,7 @@
+# name|config override (JSON)|patches from tools/patches (comma-separated, - for none)
+A|{}|-
+T10|{"train_s1_frac": 1.0}|-
+S4|{"train_s1_frac": 1.0}|numfeat,hnum_ctx,native_map
+S4F|{"train_s1_frac": 1.0}|numfeat,hnum_ctx,native_map,fillers
+S4O|{"train_s1_frac": 1.0, "orphan_frac": 0.19}|numfeat,hnum_ctx,native_map
+S4FO|{"train_s1_frac": 1.0, "orphan_frac": 0.19}|numfeat,hnum_ctx,native_map,fillers
