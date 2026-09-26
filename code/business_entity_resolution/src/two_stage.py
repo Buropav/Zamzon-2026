@@ -29,7 +29,6 @@ import os
 import shutil
 import time
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
@@ -472,18 +471,29 @@ def apply_prefilter(cands, qp, dp, pf, step=4_000_000):
 
 
 # ------------------------------------------------------------------ model backends
-BACKEND = os.environ.get("ER_BACKEND", "auto")  # "auto" (xgb on GPU, else lgbm), "lgbm" or "xgb"
+BACKEND = os.environ.get("ER_BACKEND", "xgb")  # "xgb" (XGBoost, CUDA whenever a GPU is visible) or "lgbm"
 XGB_PARAMS = dict(n_estimators=3000, learning_rate=0.05, max_depth=8, min_child_weight=5, subsample=0.8,
                   colsample_bytree=0.8, tree_method="hist", max_bin=256, eval_metric="logloss",
                   random_state=42, n_jobs=-1)
 
 
+_DEVICE = None
+
+
 def _xgb_device():
-    try:
-        import cupy as cp
-        return "cuda" if USE_GPU and cp.cuda.runtime.getDeviceCount() > 0 else "cpu"
-    except Exception:
-        return "cpu"
+    """'cuda' when XGBoost can train on a GPU (checked by XGBoost itself, so it does not depend on CuPy)."""
+    global _DEVICE
+    if _DEVICE is None:
+        _DEVICE = "cpu"
+        if USE_GPU:
+            try:
+                import xgboost as xgb
+                xgb.XGBClassifier(n_estimators=1, device="cuda", tree_method="hist").fit(
+                    np.array([[0.0], [1.0]], np.float32), np.array([0, 1]))
+                _DEVICE = "cuda"
+            except Exception as e:  # pragma: no cover
+                print(f"  (XGBoost GPU unavailable: {type(e).__name__}: {e}; XGBoost runs on CPU)")
+    return _DEVICE
 
 
 class _Model:
@@ -501,6 +511,7 @@ class _Model:
             p = {**LGB_PARAMS, **over}
             if n_estimators:
                 p["n_estimators"] = n_estimators
+            import lightgbm as lgb
             self.m = lgb.LGBMClassifier(**p)
 
     def fit(self, X, y, Xv=None, yv=None):
@@ -514,6 +525,7 @@ class _Model:
             self.best_iteration_ = (self.m.best_iteration + 1) if Xv is not None else self.m.n_estimators
         else:
             if Xv is not None:
+                import lightgbm as lgb
                 self.m.fit(X, y, eval_set=[(Xv, yv)], callbacks=[lgb.early_stopping(50, verbose=False)])
             else:
                 self.m.fit(X, y)
@@ -531,16 +543,10 @@ class _Model:
 
 
 def resolve_backend(backend=None):
-    """A/B on whole training regions: XGBoost 0.9786 vs LightGBM 0.9783 held-out F0.5 (equal within noise);
-    XGBoost is much faster on a GPU, LightGBM on CPU-only machines."""
+    """XGBoost by default (on the GPU when one is visible). 'lgbm' only when asked for explicitly
+    (ER_BACKEND=lgbm); 'auto' is treated as XGBoost."""
     b = backend or BACKEND
-    if b == "auto":
-        try:
-            import xgboost  # noqa: F401
-            b = "xgb" if _xgb_device() == "cuda" else "lgbm"
-        except Exception:
-            b = "lgbm"
-    return b
+    return "lgbm" if b == "lgbm" else "xgb"
 
 
 def _fit(X, y, Xv=None, yv=None, n_estimators=None, backend=None, **over):

@@ -58,7 +58,7 @@ md("""
   reverse (each Source 2/3 record -> its best Source 1 records), and exact keys (house number + name).
 - **Prefilter**: small GBDT on blocking similarities + fast features drops ~90% of candidates, keeps ~99.98% of true pairs.
 - **Matching**: stage-1 GBDT on pair features (incl. address-number alignment that separates the generator's decoys
-  from true copies) -> stage-2 GBDT with group context (out-of-fold); XGBoost on GPU, LightGBM on CPU-only machines.
+  from true copies) -> stage-2 GBDT with group context (out-of-fold); XGBoost on the GPU (CUDA).
 - **Selection**: two thresholds (tau1, tau2) tuned on Macro F0.5, globally one-to-one.
 
 Set `DEV_MODE = True` in the config cell for a quick sanity run.
@@ -89,6 +89,13 @@ try:
     print(f"GPU: {_cp.cuda.runtime.getDeviceCount()} CUDA device(s) -> TF-IDF blocking (and XGBoost) run on GPU")
 except Exception as _e:
     print(f"GPU not available ({type(_e).__name__}) -> blocking runs on CPU")
+try:
+    import numpy as _np, xgboost as _xgb
+    _xgb.XGBClassifier(n_estimators=1, device="cuda", tree_method="hist").fit(_np.array([[0.0], [1.0]]), _np.array([0, 1]))
+    print(f"XGBoost {_xgb.__version__}: CUDA OK -> prefilter and both GBDT stages train on the GPU")
+except Exception as _e:
+    print(f"WARNING: XGBoost cannot use the GPU ({type(_e).__name__}: {_e}) -> it trains on CPU (slow). "
+          "Set Accelerator = GPU T4 x2.")
 print(f"CPU cores: {os.cpu_count()} -> text cleaning and pair features run in parallel")
 """)
 
@@ -102,7 +109,7 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-import lightgbm as lgb
+import xgboost as xgb
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from rapidfuzz import fuzz
@@ -124,7 +131,7 @@ code("""
 # [CONFIG] Global Configuration & Direct Dataset Path Discovery
 DEV_MODE = False  # Set to False for complete 1.73M test submission run
 os.environ.setdefault("ER_USE_GPU", "1")      # GPU blocking (CPU fallback is automatic)
-os.environ.setdefault("ER_BACKEND", "auto")   # auto: XGBoost on GPU if present, else LightGBM
+os.environ.setdefault("ER_BACKEND", "xgb")    # XGBoost for the prefilter and both stages (CUDA on the GPU)
 USE_CONTEXT = False  # training: add owners of unknown-region Source 2/3 records as competitors (see sampling.py)
 
 IS_KAGGLE = Path("/kaggle/input").exists()
@@ -331,7 +338,7 @@ metrics_data = {
     "train_recall_after_prefilter": round(float(model["recall_prefilter"]), 4),
     "train_pairs_after_prefilter": int(model["n_train_pairs"]),
     "train_regions": list(TRAIN_REGIONS),
-    "model_backend": resolve_backend(), "gpu_blocking": _gpu() is not None,
+    "model_backend": resolve_backend(), "xgboost_device": _xgb_device(), "gpu_blocking": _gpu() is not None,
     "test_s1_count": len(test_s1), "test_candidate_pairs": int(len(test_cands)), "test_matches": int(len(test_sel)),
     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
 }
@@ -339,7 +346,7 @@ with open(WORKING_DIR / "metrics.json", "w") as f:
     json.dump(metrics_data, f, indent=2)
 print(json.dumps(metrics_data, indent=2))
 
-_backend_name = {"xgb": "XGBoost (GPU)", "lgbm": "LightGBM"}.get(resolve_backend(), resolve_backend())
+_backend_name = f"XGBoost ({'GPU' if _xgb_device() == 'cuda' else 'CPU'})" if resolve_backend() == "xgb" else "LightGBM"
 methodology_content = f\"\"\"# Business Entity Resolution - Methodology
 ### Team: zamzon_ai
 
