@@ -57,11 +57,13 @@ def main(a):
     log("[2/5] Normalisation, blocking...")
     s1p, s23p = prepare_side(s1), prepare_side(s23)
     cands = block_candidates(s1p, s23p, log=log)
-    # owners of the unknown-region Source 2/3 records the sample retrieved: competitors, never trained on
-    ctx, ctx_gt, ctx_di = context_owners(cands, s1p, s23p, s1_all, gt_all)
-    s1p, cands, core = add_context(s1p, s23p, cands, prepare_side(ctx), relevant_di=ctx_di, log=log)
-    gt_dict.update(parse_gt(ctx_gt))
-    del s1_all, gt_all, ctx, ctx_gt
+    core = None
+    if a.context:  # owners of the unknown-region Source 2/3 records the sample retrieved: competitors, never trained on
+        ctx, ctx_gt, ctx_di = context_owners(cands, s1p, s23p, s1_all, gt_all)
+        s1p, cands, core = add_context(s1p, s23p, cands, prepare_side(ctx), relevant_di=ctx_di, log=log)
+        gt_dict.update(parse_gt(ctx_gt))
+        del ctx, ctx_gt
+    del s1_all, gt_all
     s1_ids, s23_ids = s1p["entity_id"].to_numpy(), s23p["entity_id"].to_numpy()
     y = np.array([s23_ids[d] in gt_dict.get(s1_ids[q], ()) for q, d in zip(cands.qi, cands.di)], np.int32)
     n_true = np.array([len(gt_dict.get(e, ())) for e in s1_ids])
@@ -118,5 +120,6 @@ if __name__ == "__main__":
     ap.add_argument("--regions", nargs="+", default=list(DEFAULT_REGION_KEYS))
     ap.add_argument("--chunk-size", type=int, default=100_000)
     ap.add_argument("--validator", default=None)
+    ap.add_argument("--context", action="store_true", help="add context owners in training (notebook: USE_CONTEXT)")
     ap.add_argument("--dev", action="store_true")
     main(ap.parse_args())
