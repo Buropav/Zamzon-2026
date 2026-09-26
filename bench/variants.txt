@@ -4,6 +4,7 @@ A|{}|-
 S5nn|{"train_s1_frac": 1.0}|numfeat,hnum_ctx,fillers
 S6sp|{"train_s1_frac": 1.0}|numfeat,hnum_ctx,fillers,stateparse
 S7|{"train_s1_frac": 1.0}|numfeat,hnum_ctx,fillers,stateparse,flatkey
-S7lr03|{"train_s1_frac": 1.0, "xgb_params": {"learning_rate": 0.03}, "stage1_rounds": 6000, "stage2_rounds": 6000}|numfeat,hnum_ctx,fillers,stateparse,flatkey
-S7f5|{"train_s1_frac": 1.0, "n_folds": 5}|numfeat,hnum_ctx,fillers,stateparse,flatkey
-S7d12|{"train_s1_frac": 1.0, "xgb_params": {"learning_rate": 0.05, "max_depth": 12}}|numfeat,hnum_ctx,fillers,stateparse,flatkey
+S8|{"train_s1_frac": 1.0}|numfeat,hnum_ctx,fillers,stateparse,flatkey,translit
+S8lr03|{"train_s1_frac": 1.0, "xgb_params": {"learning_rate": 0.03}, "stage1_rounds": 6000, "stage2_rounds": 6000}|numfeat,hnum_ctx,fillers,stateparse,flatkey,translit
+S8f5|{"train_s1_frac": 1.0, "n_folds": 5}|numfeat,hnum_ctx,fillers,stateparse,flatkey,translit
+S8d12|{"train_s1_frac": 1.0, "xgb_params": {"learning_rate": 0.05, "max_depth": 12}}|numfeat,hnum_ctx,fillers,stateparse,flatkey,translit
