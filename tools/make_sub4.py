@@ -5,7 +5,8 @@ machine, plus the ported parts that passed the benchmark. Each part is applied w
 was benchmarked (tools/patches/<part>.py) to the notebook's %%writefile module sources, so the notebook runs
 byte-for-byte the benchmarked code. New modules become new %%writefile cells.
 
-    python tools/make_sub4.py --parts numfeat,hnum_ctx,native_map --fracs 1.0,0.5,0.3
+    python tools/make_sub4.py --parts numfeat,hnum_ctx,native_map --fracs 1.0,0.5,0.3                 # erk_sub4
+    python tools/make_sub4.py --parts numfeat,hnum_ctx,native_map,fillers --out erk_sub5.ipynb         # erk_sub5
 """
 import argparse
 import json
@@ -20,11 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import make_sub3a3 as s3  # noqa: E402
 
 WF = re.compile(r'^%%writefile "\{SRC_DIR\}/ber/(\w+\.py)"\n')
-ADDED_COLS = {"numfeat": 15, "hnum_ctx": 2, "native_map": 0}   # feature-matrix columns each part adds
+ADDED_COLS = {"numfeat": 15, "hnum_ctx": 2, "native_map": 0, "fillers": 0}   # feature-matrix columns each part adds
 DESCR = {
     "numfeat": "address-number alignment features (exact / small shift / one-digit typo / truncation, from the old pipeline)",
     "hnum_ctx": "same-house-number context in stage 2 (other candidates of the S1 sharing the house number)",
     "native_map": "native-script -> Latin word map learned from the TRAIN ground truth only",
+    "fillers": "generator filler words (S2/S3-only words, e.g. French participations/holding/distribution) learned from the data and removed from core names; French et -> and, cie/compagnie -> co",
 }
 
 
@@ -40,8 +42,9 @@ def main():
 
     # 1. erk_sub3a3's edits (training-fraction guard), with the options and column count for this build
     n_cols = 88 + sum(ADDED_COLS[p] for p in parts)
-    header = ("# Amazon ML Challenge 2026 — Business Entity Resolution, submission 4 (big-RAM machine, e.g. AWS r6i.8xlarge)\n\n"
-              "**Submission 4 = submission 2 (`erk_sub2_1`) + benchmarked changes:**\n"
+    num = re.sub(r"\D", "", Path(a.out).stem) or "4"
+    header = (f"# Amazon ML Challenge 2026 — Business Entity Resolution, submission {num} (big-RAM machine, e.g. AWS r6i.8xlarge)\n\n"
+              f"**Submission {num} = submission 2 (`erk_sub2_1`) + these changes:**\n"
               f"- training fraction: largest of {fracs} whose extra memory over 0.3 fits (see the `train_s1_frac` log lines)\n"
               + "".join(f"- {DESCR[p]}\n" for p in parts))
     for cell, old, new in s3.EDITS:

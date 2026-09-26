@@ -22,7 +22,7 @@ from .normalize import phonetic_key
 MIN_RATE = 0.002     # share of the country's Latin-script S2/S3 names containing the word
 MIN_RATIO = 50.0     # per-record rate in S2/S3 names / per-record rate in S1 names (S1 count + 1)
 TYPO_VOCAB_MIN = 50  # S1 words this frequent protect their one-edit variants (typos are not fillers)
-VERSION = "fill2"    # part of the candidate cache key
+VERSION = "fill3"    # part of the candidate cache key
 
 
 def _token_counts(df):
@@ -95,8 +95,18 @@ edit("prep.py", "NORM_VERSION = 2\n", 'NORM_VERSION = "2f"   # [fillers] normali
 # learned fillers, applied in load_split for both splits
 edit("pipeline.py", "from . import block, decide, geo, model\n", "from . import block, decide, fillers, geo, model\n")
 edit("pipeline.py", "    return s1, s23\n\n\ndef cached_candidates",
-     "    # [fillers] generator filler words learned from this split (no labels), removed from core names\n"
+     "    # [fillers] generator filler words (no labels), removed from core names. Countries seen in training use\n"
+     "    # the list learned on the TRAIN split for both splits (same rule, no train/test skew); countries only in\n"
+     "    # test (France) use the list learned on the test split.\n"
      "    fl = fillers.learn_fillers(s1, s23)\n"
+     "    fpath = Path(cfg[\"work_dir\"]) / f\"fillers_train_{fillers.VERSION}.json\"\n"
+     "    if split == \"train\":\n"
+     "        fpath.write_text(json.dumps({\"countries\": sorted(set(s1[\"country\"].unique().to_list())),\n"
+     "                                     \"fillers\": {k: sorted(v) for k, v in fl.items()}}))\n"
+     "    elif fpath.exists():\n"
+     "        tr = json.loads(fpath.read_text())\n"
+     "        fl = {k: v for k, v in fl.items() if k not in tr[\"countries\"]}\n"
+     "        fl.update({k: set(v) for k, v in tr[\"fillers\"].items()})\n"
      "    s1, n1 = fillers.strip_fillers(s1, fl)\n"
      "    s23, n23 = fillers.strip_fillers(s23, fl)\n"
      "    log(f\"{split}: learned filler words {({k: sorted(v) for k, v in sorted(fl.items())})}; core names changed: \"\n"
