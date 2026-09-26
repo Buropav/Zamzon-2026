@@ -5,7 +5,7 @@ Kaggle's limits are its 4 CPU cores and ~32 GB RAM, so pick an instance for core
 
 | instance | vCPU | RAM | GPU | use |
 |---|---|---|---|---|
-| g5.8xlarge / g6.8xlarge | 32 | 128 GB | 1 (A10G / L4) | any notebook (the old `entity_resolution.ipynb` needs a GPU for CuPy blocking) |
+| g5.8xlarge / g6.8xlarge | 32 | 128 GB | 1 (A10G / L4) | any notebook |
 | r7i.8xlarge | 32 | 256 GB | none | friend-based notebooks (XGBoost falls back to CPU) |
 
 Use an Ubuntu Deep Learning AMI (NVIDIA driver preinstalled) with ~100 GB disk. Stop the instance when idle.

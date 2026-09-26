@@ -1,4 +1,4 @@
-# Business Entity Resolution (ML Challenge 2026, team zamzon_ai)
+# Business Entity Resolution (ML Challenge 2026)
 
 Match Source 2/3 business records to the deduplicated Source 1 records (US, India, and France,
 which appears only in test). Metric: per-entity macro F0.5. Full problem text: `docs/problem_statement.md`.
@@ -6,23 +6,14 @@ which appears only in test). Metric: per-entity macro F0.5. Full problem text: `
 ## Layout
 | Path | What |
 |---|---|
-| `entity_resolution.ipynb` | Kaggle notebook (generated; do not edit by hand) |
-| `build_notebook.py` | Generates the notebook from `code/business_entity_resolution/src/` |
-| `code/business_entity_resolution/` | Submission package: `pipeline.py`, `src/`, `local_eval.py`, README, requirements |
-| `jev/` | Offline build of the static lexicon in `src/resources/` (see `jev/README.md`) |
-| `dataset/{train,test,dev}` | Challenge data (not versioned) |
+| `erk_sub2_1.ipynb` | Friend's known-good notebook (submission 2). Never edited; the fallback submission. |
+| `erk_sub3a*.ipynb` | Friend's notebook + one measured change each (built by `tools/make_sub3a*.py`) |
+| `tools/` | Notebook builders (exact, asserted text edits on `erk_sub2_1.ipynb`), submission log helper |
+| `aws/` | `run_notebook.sh`: run any notebook on an AWS instance with a RAM log |
+| `code/business_entity_resolution/` | Retired old pipeline, reference only (see its README) |
+| `docs/` | Problem statement, documentation template, notes |
 | `utils/validate_submission.py` | Official output validator |
-| `docs/` | Problem statement, documentation template, methodology notes |
-| `submissions/` | One dated folder per leaderboard submission (notebook, metrics, notes) + git tag `sub-*` |
-| `tools/record_submission.py` | Creates a submission entry and its tag |
-| `output/` | Latest `matching_results.tsv` / `candidate_pairs.tsv` (not versioned) |
-| `archive/` | Superseded scripts, old artifacts and backups |
+| `submissions/` | Submission log |
 
-## Common commands
-```bash
-uv sync                                   # environment
-uv run python build_notebook.py           # regenerate entity_resolution.ipynb after editing src/
-cd code/business_entity_resolution
-uv run python pipeline.py --train-dir ../../dataset/train --test-dir ../../dataset/test --output-dir ../../output
-uv run python local_eval.py --mode lexicon --stage2   # offline A/B on whole training regions
-```
+Rule for every new version: one change, benchmarked locally (same data, repeated runs, noise floor)
+before it goes to Kaggle/AWS. No external data, APIs or LLM-built resources in any submission.
