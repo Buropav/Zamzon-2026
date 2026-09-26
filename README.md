@@ -7,7 +7,7 @@ which appears only in test). Metric: per-entity macro F0.5. Full problem text: `
 | Path | What |
 |---|---|
 | `erk_sub2_1.ipynb` | Friend's known-good notebook (submission 2). Never edited; the fallback submission. |
-| `erk_sub3a*.ipynb` | Friend's notebook + one measured change each (built by `tools/make_sub3a*.py`) |
+| `erk_sub3a3.ipynb` | Friend's notebook + training fraction 0.5 when its extra memory fits (built by `tools/make_sub3a3.py`) |
 | `tools/` | Notebook builders (exact, asserted text edits on `erk_sub2_1.ipynb`), submission log helper |
 | `aws/` | `run_notebook.sh`: run any notebook on an AWS instance with a RAM log |
 | `code/business_entity_resolution/` | Retired old pipeline, reference only (see its README) |
