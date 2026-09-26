@@ -15,7 +15,9 @@ from .er_lexicon import load_default, country_aware, country_key, distinct_token
 from .geo import region_key
 from .extra_feats import (addr_numbers, num_matrix, num_features, compact, compact_features, token_features,
                           NUM_COLS, CMP_COLS, TOK_COLS)
-from .translit import apply_frame
+from .translit import apply_frame, apply_native
+from .er_multilingual import normalize_ml
+from .er_lexicon import wrap
 _LEX = load_default()
 prepare_ml = country_aware(_ML.prepare_ml, vars(_ML), _LEX)
 # </package-only>
@@ -227,6 +229,33 @@ def _share_objects(df):
         df[col] = [n if v == n else v for v, n in zip(df[col].to_numpy(object), name)]
     if "ml_dba" in df:
         df["ml_dba"] = [(n,) if len(t) == 1 and t[0] == n else t for t, n in zip(df["ml_dba"], name)]
+
+
+def _name_norm_task(args):
+    names, countries = args
+    fns, out = {}, []
+    for n, c in zip(names, countries):
+        k = country_key(c)
+        f = fns.get(k)
+        if f is None:
+            f = fns[k] = wrap(normalize_ml, _LEX, k if k in _LEX["lex"] else "*")
+        n = "" if n is None else str(n)
+        if NATIVE_MAP:
+            n = apply_native(n, NATIVE_MAP["name"])
+        out.append(f(n, "name"))
+    return out
+
+
+def name_norms(df, n_jobs=None):
+    """norm_name exactly as prepare_side computes it (names only) for a whole table, in parallel. Used for the
+    country-wide name competition (global_names.py) over ALL Source 1 records."""
+    n = n_jobs or N_JOBS
+    names = df["business_name"].fillna("").astype(str).to_numpy(object)
+    ctry = df["country"].fillna("").astype(str).to_numpy(object)
+    parts = np.array_split(np.arange(len(df)), max(1, n * 8))
+    items = [(names[i], ctry[i]) for i in parts]
+    res = _fork_map(_name_norm_task, items, n) if n > 1 and len(df) >= 40_000 else [_name_norm_task(x) for x in items]
+    return np.array([x for r in res for x in r], dtype=object)
 
 
 def _prepare_rows_task(args):

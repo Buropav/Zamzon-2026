@@ -89,13 +89,26 @@ try:
     print(f"GPU: {_cp.cuda.runtime.getDeviceCount()} CUDA device(s) -> TF-IDF blocking (and XGBoost) run on GPU")
 except Exception as _e:
     print(f"GPU not available ({type(_e).__name__}) -> blocking runs on CPU")
+import subprocess as _sp
 try:
-    import numpy as _np, xgboost as _xgb
-    _xgb.XGBClassifier(n_estimators=1, device="cuda", tree_method="hist").fit(_np.array([[0.0], [1.0]]), _np.array([0, 1]))
-    print(f"XGBoost {_xgb.__version__}: CUDA OK -> prefilter and both GBDT stages train on the GPU")
-except Exception as _e:
-    print(f"WARNING: XGBoost cannot use the GPU ({type(_e).__name__}: {_e}) -> it trains on CPU (slow). "
-          "Set Accelerator = GPU T4 x2.")
+    _gpus = [l for l in _sp.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=30).stdout.splitlines()
+             if l.startswith("GPU")]
+except Exception:
+    _gpus = []
+print(f"GPUs visible: {len(_gpus)}")
+for _g in _gpus:
+    print("  " + _g)
+REQUIRE_GPU = True   # the full test run needs the GPUs (blocking + XGBoost); on CPU it cannot finish in 12 h
+if not _gpus and REQUIRE_GPU:
+    raise RuntimeError("No GPU attached. In the notebook settings set Accelerator = 'GPU T4 x2' and run again "
+                       "(or set REQUIRE_GPU = False to run on CPU anyway, e.g. with DEV_MODE = True).")
+if _gpus and REQUIRE_GPU:
+    try:
+        import cupy as _cp2
+        _cp2.arange(2).sum()
+    except Exception as _e:
+        raise RuntimeError(f"GPUs are attached but CuPy does not work ({type(_e).__name__}: {_e}); blocking would run on "
+                           "CPU and not finish. Turn Internet on (Settings) so cupy-cuda12x installs, then run again.")
 print(f"CPU cores: {os.cpu_count()} -> text cleaning and pair features run in parallel")
 """)
 
@@ -132,6 +145,7 @@ code("""
 DEV_MODE = False  # Set to False for complete 1.73M test submission run
 os.environ.setdefault("ER_USE_GPU", "1")      # GPU blocking (CPU fallback is automatic)
 os.environ.setdefault("ER_BACKEND", "xgb")    # XGBoost for the prefilter and both stages (CUDA on the GPU)
+USE_GLOBAL_NAMES = False  # country-wide name competition for unknown-region records (global_names.py)
 USE_CONTEXT = False  # training: add owners of unknown-region Source 2/3 records as competitors (see sampling.py)
 
 IS_KAGGLE = Path("/kaggle/input").exists()
@@ -218,7 +232,7 @@ print("Lexicon loaded:", {{c: len(v["tok"]["name"]) + len(v["tok"]["addr"]) + le
 
 # Cell 8: Scalable Country-Partitioned Blocking; native-script map learned from training pairs; generator-aware
 # pair features (address-number alignment, compact names, token differences)
-code(inline("blocking.py") + "\n\n\n" + inline("translit.py") + "\n\n\n" + inline("extra_feats.py"))
+code(inline("blocking.py") + "\n\n\n" + inline("translit.py") + "\n\n\n" + inline("extra_feats.py") + "\n\n\n" + inline("global_names.py"))
 
 # Cell 9: Region keys (state / region) for regional blocking, then unified feature engineering
 code(inline("geo.py") + "\n\n\n" + inline("features.py"))
@@ -270,17 +284,26 @@ if USE_CONTEXT:
     s1p, cands, core = add_context(s1p, s23p, cands, prepare_side(ctx), relevant_di=ctx_di, log=print)
     gt_dict.update(parse_gt(ctx_gt))
     del ctx, ctx_gt
+GN_TRAIN, Q_FULL = None, None
+if USE_GLOBAL_NAMES:
+    _t = time.time()
+    _names = name_norms(S1_ALL)
+    GN_TRAIN = GlobalNames(_names, S1_ALL["country"].map(canon_country).to_numpy(object), s23p,
+                           lambda Q, DT, k, ms: _topk_any(Q, DT, k, ms, _gpu()))
+    Q_FULL = pd.Index(S1_ALL["entity_id"]).get_indexer(s1p["entity_id"])
+    del _names
+    print(f"Global name competition ready ({time.time() - _t:.0f}s)")
 del S1_ALL, GT_ALL; gc.collect()
 s1_ids, s23_ids = s1p["entity_id"].to_numpy(), s23p["entity_id"].to_numpy()
 labels = np.array([s23_ids[d] in gt_dict.get(s1_ids[q], ()) for q, d in zip(cands.qi, cands.di)], np.int32)
 n_true = np.array([len(gt_dict.get(e, ())) for e in s1_ids])
 print(f"Blocked: {len(cands):,} pairs ({len(cands)/max(len(s1p),1):.1f} per Source 1)  ({time.time()-T0:.0f}s)")
 
-model = fit_pipeline(cands, s1p, s23p, labels, n_true, core=core)   # prefilter -> pair features -> two-stage GBDT
+model = fit_pipeline(cands, s1p, s23p, labels, n_true, core=core, gnames=GN_TRAIN, q_full=Q_FULL)   # prefilter -> pair features -> two-stage GBDT
 recall = model["recall_prefilter"]
 best_f05, t1, t2 = model["f05_test"], model["t1"], model["t2"]
 print("Top stage-2 features:", ", ".join(model["stage2_importance"].head(10).index))
-del cands, s1p, s23p, s1, s23, gt; gc.collect()
+del cands, s1p, s23p, s1, s23, gt, GN_TRAIN, Q_FULL; gc.collect()
 print(f"Training done in {time.time()-T0:.0f}s")
 """)
 
@@ -310,7 +333,12 @@ TEST_BLOCK_BUDGET_S = 3 * 3600
 project_blocking(test_s1p, test_s23p, budget_s=TEST_BLOCK_BUDGET_S)
 print(f"Elapsed since start: {(time.time() - T0) / 60:.0f} min")
 CHUNK_SIZE = 1_000 if DEV_MODE else 100_000   # Source 1 per chunk (bounds peak memory of the prefilter features)
-test_cands, test_sel = predict_chunked(test_s1p, test_s23p, model, chunk_size=CHUNK_SIZE,
+GN_TEST = None
+if model.get("uses_gnames"):
+    GN_TEST = GlobalNames(test_s1p["norm_name"].to_numpy(object), test_s1p["country"].to_numpy(object), test_s23p,
+                          lambda Q, DT, k, ms: _topk_any(Q, DT, k, ms, _gpu()))
+    print(f"Global name competition ready ({(time.time() - T1) / 60:.0f} min)")
+test_cands, test_sel = predict_chunked(test_s1p, test_s23p, model, chunk_size=CHUNK_SIZE, gnames=GN_TEST,
                                        cache_dir=str(WORKING_DIR / "stage2_cache"))
 
 ts1_ids, ts23_ids = test_s1p["entity_id"].to_numpy(), test_s23p["entity_id"].to_numpy()

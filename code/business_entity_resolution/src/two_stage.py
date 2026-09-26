@@ -21,6 +21,7 @@ globally; pass 2 applies stage 2 chunk by chunk; selection is global.
 from .blocking import _topk_rows, union_candidates
 from .features import pair_features
 from .extra_feats import num_matrix, num_features
+from .global_names import GN_COLS
 from .groups import s1_side_features, s23_side_features, stage2_matrix
 from .metrics import macro_f05, select_matches, tune_policy
 # </package-only>
@@ -504,18 +505,18 @@ _DEVICE = None
 
 
 def _xgb_device():
-    """'cuda' when XGBoost can train on a GPU (checked by XGBoost itself, so it does not depend on CuPy)."""
+    """'cuda' when an NVIDIA GPU is visible (nvidia-smi lists one), else 'cpu'."""
     global _DEVICE
     if _DEVICE is None:
         _DEVICE = "cpu"
         if USE_GPU:
             try:
-                import xgboost as xgb
-                xgb.XGBClassifier(n_estimators=1, device="cuda", tree_method="hist").fit(
-                    np.array([[0.0], [1.0]], np.float32), np.array([0, 1]))
-                _DEVICE = "cuda"
-            except Exception as e:  # pragma: no cover
-                print(f"  (XGBoost GPU unavailable: {type(e).__name__}: {e}; XGBoost runs on CPU)")
+                import subprocess
+                out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=30).stdout
+                if any(line.startswith("GPU") for line in out.splitlines()):
+                    _DEVICE = "cuda"
+            except Exception:
+                pass
     return _DEVICE
 
 
@@ -639,7 +640,16 @@ def split_parts(n_s1, seed=42, core=None):
     return part
 
 
-def fit_pipeline(cands_raw, s1p, s23p, y_raw, n_true, seed=42, log=print, core=None):
+def _add_gn(X, gnames, q_full, di):
+    if gnames is None:
+        return X
+    G = gnames.features(q_full, di)
+    for c in GN_COLS:
+        X[c] = G[c].to_numpy()
+    return X
+
+
+def fit_pipeline(cands_raw, s1p, s23p, y_raw, n_true, seed=42, log=print, core=None, gnames=None, q_full=None):
     """Training entry point: prefilter (fit on the 60% part) -> pair features on kept candidates -> two stages.
     core: optional bool per Source 1 (False = context record, see train_two_stage).
     Returns the model dict (with the prefilter) plus recall figures."""
@@ -658,14 +668,17 @@ def fit_pipeline(cands_raw, s1p, s23p, y_raw, n_true, seed=42, log=print, core=N
     rec_raw, rec = np.asarray(y_raw)[cq_raw].sum() / n_core, y[cq].sum() / n_core
     log(f"  recall: blocking {rec_raw:.4f}, after prefilter {rec:.4f}; {len(cands):,} pairs ({time.time() - t0:.0f}s)")
     X = pair_features(cands, s1p, s23p, workers=-1)
+    qi_ = cands["qi"].to_numpy()
+    X = _add_gn(X, gnames, (np.asarray(q_full)[qi_] if q_full is not None else qi_), cands["di"].to_numpy())
     log(f"  pair features {X.shape} ({time.time() - t0:.0f}s)")
     model = train_two_stage(cands, X, y, n_true, s23p, seed=seed, log=log, core=core)
-    model.update(prefilter=pf, recall_blocking=float(rec_raw), recall_prefilter=float(rec), n_train_pairs=len(cands))
+    model.update(prefilter=pf, recall_blocking=float(rec_raw), recall_prefilter=float(rec), n_train_pairs=len(cands),
+                 uses_gnames=gnames is not None)
     return model
 
 
 def predict_chunked(test_s1p, test_s23p, model, chunk_size=250_000, cache_dir="stage2_cache", log=print,
-                    workers=-1):
+                    workers=-1, gnames=None):
     """Returns (cands, selected): DataFrames with global qi (into test_s1p) and di (into test_s23p)."""
     os.makedirs(cache_dir, exist_ok=True)
     clf1, clf2 = model["clf1"], model["clf2"]
@@ -683,6 +696,9 @@ def predict_chunked(test_s1p, test_s23p, model, chunk_size=250_000, cache_dir="s
             continue
         cc = cc.reindex(columns=["qi", "di"] + BLK_COLS + ["n_blockers"])
         X = pair_features(cc, cs, test_s23p, workers=workers)
+        if model.get("uses_gnames"):
+            assert gnames is not None, "model was trained with global name features: pass gnames"
+            X = _add_gn(X, gnames, qidx[cc["qi"].to_numpy()], cc["di"].to_numpy())
         p1 = clf1.predict_proba(X)[:, 1].astype(np.float32)
         cc = cc[["qi", "di"]].copy()
         cc["p1"] = p1
