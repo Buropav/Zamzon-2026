@@ -32,7 +32,7 @@ from src.extra_feats import build_vocab  # noqa: E402
 from src.translit import native_map_from_frames  # noqa: E402
 from src.metrics import parse_gt, gt_diagnostics  # noqa: E402
 from src.sampling import region_sample_keys, context_owners, DEFAULT_REGION_KEYS  # noqa: E402
-from src.two_stage import block_candidates, add_context, fit_pipeline, predict_chunked, id_lists  # noqa: E402
+from src.two_stage import block_candidates, add_context, fit_pipeline, predict_chunked, id_lists, project_blocking  # noqa: E402
 
 
 def main(a):
@@ -82,6 +82,7 @@ def main(a):
     del ts2, ts3
     FE.NAME_VOCAB = build_vocab(re.sub(r"[^a-z0-9]+", " ", str(x).lower()) for x in ts1["business_name"])
     ts1p, ts23p = prepare_side(ts1), prepare_side(ts23)
+    project_blocking(ts1p, ts23p, budget_s=a.block_budget_min * 60, log=log)
     cands, sel = predict_chunked(ts1p, ts23p, model, chunk_size=a.chunk_size,
                                  cache_dir=str(out_dir.parent / "stage2_cache"), log=log)
 
@@ -121,5 +122,6 @@ if __name__ == "__main__":
     ap.add_argument("--chunk-size", type=int, default=100_000)
     ap.add_argument("--validator", default=None)
     ap.add_argument("--context", action="store_true", help="add context owners in training (notebook: USE_CONTEXT)")
+    ap.add_argument("--block-budget-min", type=float, default=180, help="test blocking time budget (minutes)")
     ap.add_argument("--dev", action="store_true")
     main(ap.parse_args())

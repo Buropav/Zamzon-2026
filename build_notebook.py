@@ -304,6 +304,11 @@ test_s23p = prepare_side(test_s23, drop=SLIM)
 del test_s23; gc.collect()
 print(f"Prepared test tables ({time.time()-T1:.0f}s)")
 
+# blocking time projected from the speed measured on the training regions; optional views are dropped if the
+# projection exceeds the budget, so the run always finishes inside the 12 h Kaggle session
+TEST_BLOCK_BUDGET_S = 3 * 3600
+project_blocking(test_s1p, test_s23p, budget_s=TEST_BLOCK_BUDGET_S)
+print(f"Elapsed since start: {(time.time() - T0) / 60:.0f} min")
 CHUNK_SIZE = 1_000 if DEV_MODE else 100_000   # Source 1 per chunk (bounds peak memory of the prefilter features)
 test_cands, test_sel = predict_chunked(test_s1p, test_s23p, model, chunk_size=CHUNK_SIZE,
                                        cache_dir=str(WORKING_DIR / "stage2_cache"))

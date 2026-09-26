@@ -39,8 +39,8 @@ LGB_PARAMS = dict(n_estimators=1500, learning_rate=0.05, num_leaves=63, subsampl
                   colsample_bytree=0.8, min_child_samples=40, random_state=42, n_jobs=-1, verbose=-1)
 
 
-BLOCKERS = (("name", 30), ("core", 15), ("text", 50), ("addr", 20))  # forward: (view, top-k per Source 1)
-REVERSE = (("text", 3), ("name", 2), ("addr", 2))                    # reverse: (view, top-k per Source 2/3)
+BLOCKERS = (("name", 30), ("text", 50), ("addr", 20))  # forward: (view, top-k per Source 1)
+REVERSE = (("text", 3),)                                 # reverse: (view, top-k per Source 2/3)
 KEYS = (("kb", 30, 150), ("kb2", 30, 150))  # exact keys (view, max Source 1, max Source 2/3 per key value):
 # kb = house number + first 3 letters of a distinctive name word, kb2 = house number + compact name. They find
 # copies whose address was cut to "No 6, Bengaluru" and whose name is damaged, which TF-IDF top-k loses in dense
@@ -212,87 +212,17 @@ def _key_block(qp, dp, q_idx, d_idx, kind, max_q, max_d):
     return r, d_idx[m["i_y"].to_numpy(np.int64)], np.ones(len(r), np.float32)
 
 
-def _block_group(qp, dp, q_idx, d_idx, gpu, min_sim, max_df, rev_rows=None):
-    """Top-k for every view of one blocking group -> {label: (r local to q_idx, di global, sim)}, r sorted.
-    Forward labels are the view name, reverse labels 'r' + view name. rev_rows: bool mask over d_idx of the
-    Source 2/3 records that run reverse retrieval here (None = all, empty = none)."""
-    views = {}
-    if max_df < 1:  # relative -> absolute, with a floor so small regional pools keep informative n-grams
-        max_df = max(int(np.ceil(max_df * len(d_idx))), MAX_DF_FLOOR)
-    fwd, rev = dict(BLOCKERS), dict(REVERSE)
-    rsel = np.arange(len(d_idx)) if rev_rows is None else np.flatnonzero(rev_rows)
-    if len(rsel) == 0:
-        rev = {}
-    empty = (np.array([], np.int64), np.array([], np.int64), np.array([], np.float32))
-    for name in list(dict.fromkeys(list(fwd) + list(rev))):
-        vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4), min_df=2, max_df=max_df,
-                              sublinear_tf=True, dtype=np.float32)
-        try:
-            D = vec.fit_transform(_view(dp.iloc[d_idx], name)).tocsr()
-        except ValueError:  # tiny pool: no n-gram survives min_df/max_df
-            for lab in ([name] if name in fwd else []) + (["r" + name] if name in rev else []):
-                views[lab] = empty
-            continue
-        Q = vec.transform(_view(qp.iloc[q_idx], name)).tocsr()
-        if name in fwd:
-            r, c, v = _topk_any(Q, D.T.tocsr(), min(fwd[name], len(d_idx)), min_sim, gpu)
-            views[name] = (r, d_idx[c], v)
-        if name in rev:
-            rd, cq, v = _topk_any(D[rsel], Q.T.tocsr(), min(rev[name], len(q_idx)), min_sim, gpu)
-            o = np.argsort(cq, kind="stable")
-            views["r" + name] = (cq[o].astype(np.int64), d_idx[rsel[rd[o]]], v[o])
-        del vec, D, Q
-    for kind, max_q, max_d in KEYS:
-        views[kind] = _key_block(qp, dp, q_idx, d_idx, kind, max_q, max_d)
-    return views
-
-
-def _reverse_unknown(qp, dp, gpu, min_sim, max_df, log=None):
-    """Source 2/3 records whose region is unknown (mostly empty addresses) join every regional pool of their
-    country for the forward views, but run reverse retrieval ONCE, against all Source 1 of the country (their
-    owner can be anywhere in it). -> {label: (qi global, di global, sim)}."""
-    qc, dc = qp["country"].to_numpy(object), dp["country"].to_numpy(object)
-    dr = dp["region"].to_numpy(object) if "region" in dp else np.full(len(dp), "", object)
-    out = {"r" + n: [] for n, _ in REVERSE}
-    for g in pd.unique(qc):
-        if g == "":
-            continue
-        q_idx = np.flatnonzero(qc == g)
-        d_idx = np.flatnonzero((dc == g) & (dr == ""))
-        if len(q_idx) == 0 or len(d_idx) == 0:
-            continue
-        mdf = max(int(np.ceil(max_df * len(d_idx))), MAX_DF_FLOOR) if max_df < 1 else max_df
-        for name, k in REVERSE:
-            vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4), min_df=2, max_df=mdf,
-                                  sublinear_tf=True, dtype=np.float32)
-            try:
-                D = vec.fit_transform(_view(dp.iloc[d_idx], name)).tocsr()
-            except ValueError:
-                continue
-            Q = vec.transform(_view(qp.iloc[q_idx], name)).tocsr()
-            rd, cq, v = _topk_any(D, Q.T.tocsr(), min(k, len(q_idx)), min_sim, gpu)
-            out["r" + name].append((q_idx[cq], d_idx[rd], v))
-            del vec, D, Q
-        if log:
-            log(f"  reverse retrieval of {len(d_idx):,} unknown-region S23 against {len(q_idx):,} S1 ({g})")
-    res = {}
-    for lab, parts in out.items():
-        if parts:
-            qi = np.concatenate([p[0] for p in parts]).astype(np.int64)
-            o = np.argsort(qi, kind="stable")
-            res[lab] = (qi[o], np.concatenate([p[1] for p in parts])[o].astype(np.int64),
-                        np.concatenate([p[2] for p in parts])[o].astype(np.float32))
-    return res
-
-
-def _groups(qp, dp):
+def _groups(qp, dp, only=None):
     """Blocking groups: (label, q_idx, d_idx). Within a country, a Source 1 record with a known region is
     searched in that region plus Source 2/3 records whose region is unknown; unknown-region Source 1 records
-    are searched in the whole country. Countries without region rules (e.g. a new country) are one group."""
+    are searched in the whole country. Countries without region rules (e.g. a new country) are one group.
+    only: restrict to one country label."""
     qc, dc = qp["country"].to_numpy(object), dp["country"].to_numpy(object)
     qr = qp["region"].to_numpy(object) if "region" in qp else np.full(len(qp), "", object)
     dr = dp["region"].to_numpy(object) if "region" in dp else np.full(len(dp), "", object)
     for g in pd.unique(qc):
+        if only is not None and g != only:
+            continue
         q_c = qc == g
         d_c = np.ones(len(dp), bool) if g == "" else (dc == g) | (dc == "")
         for r in sorted(pd.unique(qr[q_c]), key=lambda x: (x == "", x)):
@@ -302,16 +232,117 @@ def _groups(qp, dp):
                 yield f"{g}/{r or '*'}", q_idx, d_idx
 
 
+BLOCK_STATS = {"work": 0.0, "seconds": 0.0}  # sum of |S1| x |pool| over groups and blocking time (runtime projection)
+
+
+def _country_block(qp, dp, g, groups, gpu, min_sim, max_df, log=None):
+    """All blocking views of one country. The TF-IDF of each view is fitted ONCE on the country's Source 2/3
+    records; every regional pool slices rows of that matrix (refitting per pool refitted the unknown-region
+    records in every pool of the country). Unknown-region Source 2/3 records run reverse retrieval once against
+    every Source 1 of the country. -> {group label: {view label: (r local to the group's q_idx, di global, sim)}}"""
+    t_start = time.time()
+    qc, dc = qp["country"].to_numpy(object), dp["country"].to_numpy(object)
+    dr = dp["region"].to_numpy(object) if "region" in dp else np.full(len(dp), "", object)
+    q_c = np.flatnonzero(qc == g)
+    d_c = np.arange(len(dp)) if g == "" else np.flatnonzero((dc == g) | (dc == ""))
+    res = {lab: {} for lab, _, _ in groups}
+    if len(q_c) == 0 or len(d_c) == 0:
+        return res
+    posQ = np.full(len(qp), -1, np.int64)
+    posQ[q_c] = np.arange(len(q_c))
+    posD = np.full(len(dp), -1, np.int64)
+    posD[d_c] = np.arange(len(d_c))
+    grp_of_q = np.full(len(qp), -1, np.int64)
+    loc_of_q = np.full(len(qp), -1, np.int64)
+    for gi, (_, q_idx, _) in enumerate(groups):
+        grp_of_q[q_idx] = gi
+        loc_of_q[q_idx] = np.arange(len(q_idx))
+    unk_local = np.flatnonzero(dr[d_c] == "")
+    mdf = max(int(np.ceil(max_df * len(d_c))), MAX_DF_FLOOR) if max_df < 1 else max_df
+    fwd, rev = dict(BLOCKERS), dict(REVERSE)
+    for name in list(dict.fromkeys(list(fwd) + list(rev))):
+        t = time.time()
+        vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4), min_df=2, max_df=mdf,
+                              sublinear_tf=True, dtype=np.float32)
+        try:
+            D = vec.fit_transform(_view(dp.iloc[d_c], name)).tocsr()
+        except ValueError:  # tiny pool: no n-gram survives min_df/max_df
+            continue
+        Q = vec.transform(_view(qp.iloc[q_c], name)).tocsr()
+        t_fit = time.time() - t
+        for lab, q_idx, d_idx in groups:
+            region = lab.split("/", 1)[1]
+            Qr, Dr = Q[posQ[q_idx]], D[posD[d_idx]]
+            if name in fwd:
+                r, c, v = _topk_any(Qr, Dr.T.tocsr(), min(fwd[name], len(d_idx)), min_sim, gpu)
+                res[lab][name] = (r, d_idx[c], v)
+            if name in rev and region != "*":  # reverse inside the pool: only that region's records
+                rows = np.flatnonzero(dr[d_idx] == region)
+                if len(rows):
+                    rd, cq, v = _topk_any(Dr[rows], Qr.T.tocsr(), min(rev[name], len(q_idx)), min_sim, gpu)
+                    o = np.argsort(cq, kind="stable")
+                    res[lab]["r" + name] = (cq[o].astype(np.int64), d_idx[rows[rd[o]]], v[o])
+        if name in rev and len(unk_local):  # unknown-region records: once, against every Source 1 of the country
+            rd, cq, v = _topk_any(D[unk_local], Q.T.tocsr(), min(rev[name], len(q_c)), min_sim, gpu)
+            gq, gd = q_c[cq], d_c[unk_local[rd]]
+            gi_of = grp_of_q[gq]
+            for gi, (lab, _, _) in enumerate(groups):
+                m = gi_of == gi
+                if not m.any():
+                    continue
+                parts = [(loc_of_q[gq[m]], gd[m], v[m])]
+                if "r" + name in res[lab]:
+                    parts.append(res[lab]["r" + name])
+                r_ = np.concatenate([p[0] for p in parts]).astype(np.int64)
+                o = np.argsort(r_, kind="stable")
+                res[lab]["r" + name] = (r_[o], np.concatenate([p[1] for p in parts])[o].astype(np.int64),
+                                        np.concatenate([p[2] for p in parts])[o].astype(np.float32))
+        if log:
+            log(f"  blocking {g} view '{name}': fit {t_fit:.0f}s, total {time.time() - t:.0f}s "
+                f"({len(q_c):,} S1 x {len(d_c):,} S23, {len(groups)} pools)")
+        del vec, D, Q
+        gc.collect()
+    for lab, q_idx, d_idx in groups:
+        for kind, max_q, max_d in KEYS:
+            res[lab][kind] = _key_block(qp, dp, q_idx, d_idx, kind, max_q, max_d)
+    BLOCK_STATS["work"] += float(sum(len(q) * len(d) for _, q, d in groups))
+    BLOCK_STATS["seconds"] += time.time() - t_start
+    return res
+
+
+def blocking_work(qp, dp):
+    """Sum over blocking pools of |Source 1| x |pool| (cost of the sparse products)."""
+    return float(sum(len(q) * len(d) for _, q, d in _groups(qp, dp)))
+
+
+def project_blocking(qp, dp, budget_s=None, log=print):
+    """Projects the blocking time of (qp, dp) from the speed measured so far (training), and drops optional
+    views until the projection fits budget_s (seconds). Returns the projected seconds."""
+    global BLOCKERS, REVERSE
+    if BLOCK_STATS["work"] <= 0:
+        return None
+    rate = BLOCK_STATS["seconds"] / BLOCK_STATS["work"]
+    n_views = lambda: len(BLOCKERS) + len(REVERSE)  # noqa: E731
+    proj = rate * blocking_work(qp, dp)
+    log(f"  projected blocking time: {proj / 60:.0f} min (measured {rate * 1e9:.2f} s per 1e9 S1 x S23)")
+    while budget_s and proj > budget_s and (REVERSE or len(BLOCKERS) > 2):
+        before = n_views()
+        if REVERSE:
+            dropped, REVERSE = REVERSE[-1], REVERSE[:-1]
+        else:
+            dropped, BLOCKERS = BLOCKERS[-1], BLOCKERS[:-1]
+        proj *= n_views() / before
+        log(f"  over the {budget_s / 60:.0f} min budget: dropping view {dropped} -> projected {proj / 60:.0f} min")
+    return proj
+
+
 def iter_candidate_chunks(qp, dp, chunk_size=250_000, min_sim=0.015, max_df=0.01, log=None):
-    """Char 3-4gram TF-IDF blocking, forward + reverse views (BLOCKERS, REVERSE), per (country, region) group (see _groups),
-    on the GPU when available. Groups are packed into chunks of about chunk_size Source 1 records.
-    Yields (qidx, cands) with cands.qi LOCAL to qp.iloc[qidx] and cands.di global."""
+    """Char 3-4gram TF-IDF blocking, forward + reverse views (BLOCKERS, REVERSE) and exact keys (KEYS), per
+    (country, region) pool (see _groups), on the GPU when available. Pools are packed into chunks of about
+    chunk_size Source 1 records. Yields (qidx, cands) with cands.qi LOCAL to qp.iloc[qidx] and cands.di global."""
     gpu = _gpu()
     buf_q, buf_c, n_buf = [], [], 0
     t0 = time.time()
-    unk = _reverse_unknown(qp, dp, gpu, min_sim, max_df, log=log)
-    d_region = dp["region"].to_numpy(object) if "region" in dp else np.full(len(dp), "", object)
-    in_slice = np.zeros(len(qp), bool)
 
     def flush():
         qidx = np.concatenate(buf_q)
@@ -319,36 +350,28 @@ def iter_candidate_chunks(qp, dp, chunk_size=250_000, min_sim=0.015, max_df=0.01
         cands = pd.concat([c.assign(qi=c["qi"].to_numpy() + o) for c, o in zip(buf_c, off)], ignore_index=True)
         return qidx, cands
 
-    for label, q_all, d_all in _groups(qp, dp):
-        region = label.split("/", 1)[1]
-        # reverse retrieval inside a regional pool only for that region's records (unknown-region ones: _reverse_unknown)
-        rev_rows = (d_region[d_all] == region) if region != "*" else np.zeros(len(d_all), bool)
-        views = _block_group(qp, dp, q_all, d_all, gpu, min_sim, max_df, rev_rows=rev_rows)
-        if log and (len(q_all) >= 20_000 or label.endswith("*")):
-            log(f"  blocking {label}: {len(q_all):,} S1 x {len(d_all):,} S23 ({time.time() - t0:.0f}s, "
-                f"{f'{len(_gpu_devices(gpu))} GPU' if gpu else 'CPU'})")
-        for s in range(0, len(q_all), chunk_size):
-            e = min(s + chunk_size, len(q_all))
-            blocks = {}
-            for name, (r, d, v) in views.items():
-                lo, hi = np.searchsorted(r, s), np.searchsorted(r, e)  # r is sorted (row-major)
-                blocks[name] = pd.DataFrame({"qi": r[lo:hi] - s, "di": d[lo:hi], "sim": v[lo:hi]})
-            q_slice = q_all[s:e]
-            in_slice[q_slice] = True
-            local = np.full(len(qp), -1, np.int64)
-            local[q_slice] = np.arange(len(q_slice))
-            for name, (gq, gd, gv) in unk.items():  # country-level reverse retrieval for these Source 1
-                m = in_slice[gq]
-                u = pd.DataFrame({"qi": local[gq[m]], "di": gd[m], "sim": gv[m]})
-                blocks[name] = pd.concat([blocks[name], u], ignore_index=True) if name in blocks else u
-            in_slice[q_slice] = False
-            buf_q.append(q_all[s:e])
-            buf_c.append(_union_fast(blocks))
-            n_buf += e - s
-            if n_buf >= chunk_size:
-                yield flush()
-                buf_q, buf_c, n_buf = [], [], 0
-        del views
+    for g in pd.unique(qp["country"].to_numpy(object)):
+        groups = list(_groups(qp, dp, only=g))
+        res = _country_block(qp, dp, g, groups, gpu, min_sim, max_df, log=log)
+        if log:
+            log(f"  blocked {g}: {sum(len(q) for _, q, _ in groups):,} S1 in {len(groups)} pools "
+                f"({time.time() - t0:.0f}s, {f'{len(_gpu_devices(gpu))} GPU' if gpu else 'CPU'})")
+        for lab, q_all, _ in groups:
+            views = res.pop(lab)
+            for s_ in range(0, len(q_all), chunk_size):
+                e = min(s_ + chunk_size, len(q_all))
+                blocks = {}
+                for name, (r, d, v) in views.items():
+                    lo, hi = np.searchsorted(r, s_), np.searchsorted(r, e)  # r is sorted (row-major)
+                    blocks[name] = pd.DataFrame({"qi": r[lo:hi] - s_, "di": d[lo:hi], "sim": v[lo:hi]})
+                buf_q.append(q_all[s_:e])
+                buf_c.append(_union_fast(blocks))
+                n_buf += e - s_
+                if n_buf >= chunk_size:
+                    yield flush()
+                    buf_q, buf_c, n_buf = [], [], 0
+            del views
+        del res
         gc.collect()
     if buf_q:
         yield flush()
@@ -472,7 +495,7 @@ def apply_prefilter(cands, qp, dp, pf, step=4_000_000):
 
 # ------------------------------------------------------------------ model backends
 BACKEND = os.environ.get("ER_BACKEND", "xgb")  # "xgb" (XGBoost, CUDA whenever a GPU is visible) or "lgbm"
-XGB_PARAMS = dict(n_estimators=3000, learning_rate=0.05, max_depth=8, min_child_weight=5, subsample=0.8,
+XGB_PARAMS = dict(n_estimators=2000, learning_rate=0.08, max_depth=8, min_child_weight=5, subsample=0.8,
                   colsample_bytree=0.8, tree_method="hist", max_bin=256, eval_metric="logloss",
                   random_state=42, n_jobs=-1)
 

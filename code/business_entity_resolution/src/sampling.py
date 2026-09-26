@@ -58,7 +58,7 @@ def region_sample(s1, s2, s3, gt, regions=DEFAULT_REGIONS):
 # Without them, an empty-address record only appears in training when it is a true match of a sampled Source 1,
 # so the model learns "empty address + similar name = match" and over-matches at test time (measured on the
 # Karnataka pool: 89% of false positives were empty-address records owned by a Source 1 in another state).
-DEFAULT_REGION_KEYS = ("OR", "KY", "AR", "MO", "WI", "NC", "KL", "PB", "HR", "OD", "RJ", "KA")  # incl. two dense ones
+DEFAULT_REGION_KEYS = ("OR", "KY", "AR", "NC", "KL", "PB", "HR", "KA")  # incl. two dense ones (NC, KA)
 
 
 def _region_keys_task(args):
