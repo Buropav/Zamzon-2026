@@ -26,7 +26,6 @@ if [ ! -x .venv/bin/python ]; then
   VIRTUAL_ENV=$ROOT/.venv uv pip install -q pip ipykernel nbconvert nbclient jupyter_client \
     "polars==1.44.2" "rapidfuzz==3.14.6" "sparse_dot_topn==1.2.0" "xgboost==3.4.1" psutil \
     pandas numpy scipy scikit-learn numba indic-transliteration
-  if command -v nvidia-smi >/dev/null; then VIRTUAL_ENV=$ROOT/.venv uv pip install -q cupy-cuda12x; fi
   .venv/bin/python -m ipykernel install --sys-prefix >/dev/null
 fi
 export PATH="$ROOT/.venv/bin:$PATH" VIRTUAL_ENV=$ROOT/.venv

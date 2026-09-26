@@ -2,12 +2,14 @@
 # Benchmark suite for a big machine (e.g. r6i.8xlarge): builds two labelled benchmarks from the TRAIN files and
 # runs every variant in bench/variants.txt REPEATS times on each, PAR runs at a time (THREADS threads each).
 #
-#   bash aws/bench.sh                  # defaults: REPEATS=3 PAR=6 THREADS=5
+#   bash aws/bench.sh                  # defaults: REPEATS=3 PAR=6 THREADS=5 (32 vCPU)
 #   REPEATS=2 PAR=8 THREADS=4 bash aws/bench.sh
 #
-# Benchmarks (seed 42): bench_kykl = Kentucky+Kerala entities split 70/30 (the one used so far);
-# bench_lb = leaderboard-like: WHOLE Kentucky+Kerala as test with 19% of their S1 removed (~40% of test S2/S3
-# unmatched, like the real test), trained on Oregon+Karnataka+North Carolina+Punjab.
+# Benchmarks (seed 42, both leaderboard-like: WHOLE test states = full-size pools, 19% of their S1 removed so ~40%
+# of test S2/S3 have no S1 match, like the real test):
+#   bench_ohka: test Ohio + Karnataka,  train North Carolina, Oregon, Arkansas, Punjab, Haryana
+#   bench_txhr: test Texas + Haryana,   train Oregon, Arkansas, North Carolina, Karnataka, Punjab
+# A change counts only if it helps on BOTH. XGBoost uses the GPU when nvidia-smi sees one (g5).
 # Output: ~/zamzon/bench_runs/results.md (paste it back), per-run logs next to it.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -34,12 +36,13 @@ RAW=$ROOT/data/student_resource/dataset
 [ -f "$REPO/utils/validate_submission.py" ] || cp data/student_resource/utils/validate_submission.py "$REPO/utils/"
 
 # benchmarks (built once)
-[ -f bench_kykl/stats.json ] || python "$REPO/bench/build.py" --raw "$RAW" --out bench_kykl --mode split --states KY,KL > build_kykl.log
-[ -f bench_lb/stats.json ] || python "$REPO/bench/build.py" --raw "$RAW" --out bench_lb --mode lb \
-  --test-states KY,KL --train-states OR,KA,NC,PB --test-orphan 0.19 > build_lb.log
+[ -f bench_ohka/stats.json ] || python "$REPO/bench/build.py" --raw "$RAW" --out bench_ohka --mode lb \
+  --test-states OH,KA --train-states NC,OR,AR,PB,HR --test-orphan 0.19 > build_ohka.log
+[ -f bench_txhr/stats.json ] || python "$REPO/bench/build.py" --raw "$RAW" --out bench_txhr --mode lb \
+  --test-states TX,HR --train-states OR,AR,NC,KA,PB --test-orphan 0.19 > build_txhr.log
 python - <<'PY'
 import json
-for b in ("bench_kykl", "bench_lb"):
+for b in ("bench_ohka", "bench_txhr"):
     s = json.load(open(f"{b}/stats.json"))
     print(b, {sp: {k: s[sp][k] for k in ("S1", "S2", "S3", "gt_pairs", "S23_unmatched_share")} for sp in ("train", "test")})
 PY
@@ -47,7 +50,7 @@ PY
 # run matrix: every variant x repeat x benchmark, PAR at a time
 RUNS=$ROOT/bench_runs; mkdir -p "$RUNS"
 grep -v '^#' "$REPO/bench/variants.txt" | grep -v '^\s*$' | while IFS='|' read -r name cfg patches; do
-  for b in bench_kykl bench_lb; do for r in $(seq 1 "$REPEATS"); do
+  for b in bench_ohka bench_txhr; do for r in $(seq 1 "$REPEATS"); do
     printf '%s\0%s\0%s\0%s\0%s\0%s\0' "$RUNS" "$ROOT/$b" "$name" "$cfg" "$patches" "$r"
   done; done
 done | xargs -0 -n 6 -P "$PAR" bash "$REPO/bench/variant.sh" | tee -a "$RUNS/progress.log"

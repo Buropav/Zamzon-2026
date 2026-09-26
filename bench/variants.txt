@@ -1,7 +1,8 @@
 # name|config override (JSON)|patches from tools/patches (comma-separated, - for none)
 A|{}|-
-T10|{"train_s1_frac": 1.0}|-
 S4|{"train_s1_frac": 1.0}|numfeat,hnum_ctx,native_map
-S4F|{"train_s1_frac": 1.0}|numfeat,hnum_ctx,native_map,fillers
-S4O|{"train_s1_frac": 1.0, "orphan_frac": 0.19}|numfeat,hnum_ctx,native_map
-S4FO|{"train_s1_frac": 1.0, "orphan_frac": 0.19}|numfeat,hnum_ctx,native_map,fillers
+S5|{"train_s1_frac": 1.0}|numfeat,hnum_ctx,native_map,fillers
+S5O|{"train_s1_frac": 1.0, "orphan_frac": 0.19}|numfeat,hnum_ctx,native_map,fillers
+S5lr03|{"train_s1_frac": 1.0, "xgb_params": {"learning_rate": 0.03}, "stage1_rounds": 6000, "stage2_rounds": 6000}|numfeat,hnum_ctx,native_map,fillers
+S5f5|{"train_s1_frac": 1.0, "n_folds": 5}|numfeat,hnum_ctx,native_map,fillers
+S5d12|{"train_s1_frac": 1.0, "xgb_params": {"learning_rate": 0.05, "max_depth": 12}}|numfeat,hnum_ctx,native_map,fillers
