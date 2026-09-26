@@ -213,13 +213,17 @@ def _key_block(qp, dp, q_idx, d_idx, kind, max_q, max_d):
     return r, d_idx[m["i_y"].to_numpy(np.int64)], np.ones(len(r), np.float32)
 
 
-def _block_group(qp, dp, q_idx, d_idx, gpu, min_sim, max_df):
+def _block_group(qp, dp, q_idx, d_idx, gpu, min_sim, max_df, rev_rows=None):
     """Top-k for every view of one blocking group -> {label: (r local to q_idx, di global, sim)}, r sorted.
-    Forward labels are the view name, reverse labels 'r' + view name."""
+    Forward labels are the view name, reverse labels 'r' + view name. rev_rows: bool mask over d_idx of the
+    Source 2/3 records that run reverse retrieval here (None = all, empty = none)."""
     views = {}
     if max_df < 1:  # relative -> absolute, with a floor so small regional pools keep informative n-grams
         max_df = max(int(np.ceil(max_df * len(d_idx))), MAX_DF_FLOOR)
     fwd, rev = dict(BLOCKERS), dict(REVERSE)
+    rsel = np.arange(len(d_idx)) if rev_rows is None else np.flatnonzero(rev_rows)
+    if len(rsel) == 0:
+        rev = {}
     empty = (np.array([], np.int64), np.array([], np.int64), np.array([], np.float32))
     for name in list(dict.fromkeys(list(fwd) + list(rev))):
         vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4), min_df=2, max_df=max_df,
@@ -235,13 +239,51 @@ def _block_group(qp, dp, q_idx, d_idx, gpu, min_sim, max_df):
             r, c, v = _topk_any(Q, D.T.tocsr(), min(fwd[name], len(d_idx)), min_sim, gpu)
             views[name] = (r, d_idx[c], v)
         if name in rev:
-            rd, cq, v = _topk_any(D, Q.T.tocsr(), min(rev[name], len(q_idx)), min_sim, gpu)
+            rd, cq, v = _topk_any(D[rsel], Q.T.tocsr(), min(rev[name], len(q_idx)), min_sim, gpu)
             o = np.argsort(cq, kind="stable")
-            views["r" + name] = (cq[o].astype(np.int64), d_idx[rd[o]], v[o])
+            views["r" + name] = (cq[o].astype(np.int64), d_idx[rsel[rd[o]]], v[o])
         del vec, D, Q
     for kind, max_q, max_d in KEYS:
         views[kind] = _key_block(qp, dp, q_idx, d_idx, kind, max_q, max_d)
     return views
+
+
+def _reverse_unknown(qp, dp, gpu, min_sim, max_df, log=None):
+    """Source 2/3 records whose region is unknown (mostly empty addresses) join every regional pool of their
+    country for the forward views, but run reverse retrieval ONCE, against all Source 1 of the country (their
+    owner can be anywhere in it). -> {label: (qi global, di global, sim)}."""
+    qc, dc = qp["country"].to_numpy(object), dp["country"].to_numpy(object)
+    dr = dp["region"].to_numpy(object) if "region" in dp else np.full(len(dp), "", object)
+    out = {"r" + n: [] for n, _ in REVERSE}
+    for g in pd.unique(qc):
+        if g == "":
+            continue
+        q_idx = np.flatnonzero(qc == g)
+        d_idx = np.flatnonzero((dc == g) & (dr == ""))
+        if len(q_idx) == 0 or len(d_idx) == 0:
+            continue
+        mdf = max(int(np.ceil(max_df * len(d_idx))), MAX_DF_FLOOR) if max_df < 1 else max_df
+        for name, k in REVERSE:
+            vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4), min_df=2, max_df=mdf,
+                                  sublinear_tf=True, dtype=np.float32)
+            try:
+                D = vec.fit_transform(_view(dp.iloc[d_idx], name)).tocsr()
+            except ValueError:
+                continue
+            Q = vec.transform(_view(qp.iloc[q_idx], name)).tocsr()
+            rd, cq, v = _topk_any(D, Q.T.tocsr(), min(k, len(q_idx)), min_sim, gpu)
+            out["r" + name].append((q_idx[cq], d_idx[rd], v))
+            del vec, D, Q
+        if log:
+            log(f"  reverse retrieval of {len(d_idx):,} unknown-region S23 against {len(q_idx):,} S1 ({g})")
+    res = {}
+    for lab, parts in out.items():
+        if parts:
+            qi = np.concatenate([p[0] for p in parts]).astype(np.int64)
+            o = np.argsort(qi, kind="stable")
+            res[lab] = (qi[o], np.concatenate([p[1] for p in parts])[o].astype(np.int64),
+                        np.concatenate([p[2] for p in parts])[o].astype(np.float32))
+    return res
 
 
 def _groups(qp, dp):
@@ -268,6 +310,9 @@ def iter_candidate_chunks(qp, dp, chunk_size=250_000, min_sim=0.015, max_df=0.01
     gpu = _gpu()
     buf_q, buf_c, n_buf = [], [], 0
     t0 = time.time()
+    unk = _reverse_unknown(qp, dp, gpu, min_sim, max_df, log=log)
+    d_region = dp["region"].to_numpy(object) if "region" in dp else np.full(len(dp), "", object)
+    in_slice = np.zeros(len(qp), bool)
 
     def flush():
         qidx = np.concatenate(buf_q)
@@ -276,7 +321,10 @@ def iter_candidate_chunks(qp, dp, chunk_size=250_000, min_sim=0.015, max_df=0.01
         return qidx, cands
 
     for label, q_all, d_all in _groups(qp, dp):
-        views = _block_group(qp, dp, q_all, d_all, gpu, min_sim, max_df)
+        region = label.split("/", 1)[1]
+        # reverse retrieval inside a regional pool only for that region's records (unknown-region ones: _reverse_unknown)
+        rev_rows = (d_region[d_all] == region) if region != "*" else np.zeros(len(d_all), bool)
+        views = _block_group(qp, dp, q_all, d_all, gpu, min_sim, max_df, rev_rows=rev_rows)
         if log and (len(q_all) >= 20_000 or label.endswith("*")):
             log(f"  blocking {label}: {len(q_all):,} S1 x {len(d_all):,} S23 ({time.time() - t0:.0f}s, "
                 f"{f'{len(_gpu_devices(gpu))} GPU' if gpu else 'CPU'})")
@@ -286,6 +334,15 @@ def iter_candidate_chunks(qp, dp, chunk_size=250_000, min_sim=0.015, max_df=0.01
             for name, (r, d, v) in views.items():
                 lo, hi = np.searchsorted(r, s), np.searchsorted(r, e)  # r is sorted (row-major)
                 blocks[name] = pd.DataFrame({"qi": r[lo:hi] - s, "di": d[lo:hi], "sim": v[lo:hi]})
+            q_slice = q_all[s:e]
+            in_slice[q_slice] = True
+            local = np.full(len(qp), -1, np.int64)
+            local[q_slice] = np.arange(len(q_slice))
+            for name, (gq, gd, gv) in unk.items():  # country-level reverse retrieval for these Source 1
+                m = in_slice[gq]
+                u = pd.DataFrame({"qi": local[gq[m]], "di": gd[m], "sim": gv[m]})
+                blocks[name] = pd.concat([blocks[name], u], ignore_index=True) if name in blocks else u
+            in_slice[q_slice] = False
             buf_q.append(q_all[s:e])
             buf_c.append(_union_fast(blocks))
             n_buf += e - s
@@ -344,6 +401,26 @@ def block_candidates(qp, dp, log=None):
     return c
 
 
+CTX_REGION = "~ctx"
+
+
+def add_context(s1p, s23p, cands, ctx_p, relevant_di=None, log=print):
+    """Appends prepared context Source 1 records (see sampling.context_owners), searched only among the
+    unknown-region Source 2/3 records (their own regions are not in the sample); only their pairs with the
+    relevant Source 2/3 records (relevant_di) are kept. -> (s1p, cands, core mask)."""
+    if len(ctx_p) == 0:
+        return s1p, cands, np.ones(len(s1p), bool)
+    ctx_p = ctx_p.copy()
+    ctx_p["region"] = CTX_REGION
+    cc = block_candidates(ctx_p, s23p, log=log)
+    if relevant_di is not None:
+        cc = cc[np.isin(cc["di"].to_numpy(), relevant_di)].reset_index(drop=True)
+    cc["qi"] = cc["qi"].to_numpy() + len(s1p)
+    core = np.r_[np.ones(len(s1p), bool), np.zeros(len(ctx_p), bool)]
+    log(f"  context: {len(ctx_p):,} owners of unknown-region S23 records, {len(cc):,} candidate pairs")
+    return pd.concat([s1p, ctx_p], ignore_index=True), pd.concat([cands, cc], ignore_index=True), core
+
+
 # ------------------------------------------------------------------ prefilter
 PF_THRESHOLD_CAP = float(os.environ.get("ER_PF_CAP", "0.001"))
 PF_THRESHOLD_FLOOR = float(os.environ.get("ER_PF_FLOOR", "0.0001"))  # pairs below 1e-4 are never selected anyway
@@ -377,20 +454,21 @@ def train_prefilter(C, y, part_of_row, keep_recall=0.9998, log=print):
     fit = part_of_row == 0
     m = _Model(resolve_backend(), n_estimators=300, learning_rate=0.1, max_depth=6, num_leaves=63).fit(C[fit], y[fit])
     p = m.predict_proba(C)[:, 1]
-    ho = (~fit) & (y == 1)
+    ho = ((part_of_row == 1) | (part_of_row == 2)) & (y == 1)
     th = float(np.quantile(p[ho], 1 - keep_recall)) if ho.any() else 0.0
     th = min(max(th, PF_THRESHOLD_FLOOR), PF_THRESHOLD_CAP)
     keep = p >= th
     log(f"  prefilter: threshold {th:.5f}, keeps {keep.mean():.3f} of candidates, "
-        f"{(keep & (y == 1))[~fit].sum() / max((y == 1)[~fit].sum(), 1):.5f} of held-out true pairs")
+        f"{(keep & ho).sum() / max(ho.sum(), 1):.5f} of held-out true pairs")
     return {"model": m, "threshold": th}, keep
 
 
-def apply_prefilter(cands, qp, dp, pf):
+def apply_prefilter(cands, qp, dp, pf, step=4_000_000):
     """-> boolean keep mask for cands."""
     if pf is None or len(cands) == 0:
         return np.ones(len(cands), bool)
-    return pf["model"].predict_proba(cheap_features(cands, qp, dp))[:, 1] >= pf["threshold"]
+    return np.concatenate([pf["model"].predict_proba(cheap_features(cands.iloc[i:i + step], qp, dp))[:, 1] >= pf["threshold"]
+                           for i in range(0, len(cands), step)])
 
 
 # ------------------------------------------------------------------ model backends
@@ -469,11 +547,13 @@ def _fit(X, y, Xv=None, yv=None, n_estimators=None, backend=None, **over):
     return _Model(resolve_backend(backend), n_estimators=n_estimators, **over).fit(X, y, Xv, yv)
 
 
-def train_two_stage(cands, X, y, n_true, s23p, seed=42, folds=5, log=print):
+def train_two_stage(cands, X, y, n_true, s23p, seed=42, folds=5, log=print, core=None):
     """cands: qi, di (+ blocker cols). X: stage-1 features. y: labels. n_true: true match count per S1.
-    Split by Source 1: 60% fit, 20% early stopping + threshold tuning, 20% held-out report."""
+    Split by Source 1: 60% fit, 20% early stopping + threshold tuning, 20% held-out report.
+    core: optional bool per Source 1; False = context record (scored and used as a competitor in the group
+    features and the one-to-one assignment, never trained on or evaluated)."""
     qi = cands["qi"].to_numpy()
-    part = split_parts(len(n_true), seed)
+    part = split_parts(len(n_true), seed, core)
     pq = part[qi]
     tr, va = pq == 0, pq == 1
 
@@ -496,13 +576,19 @@ def train_two_stage(cands, X, y, n_true, s23p, seed=42, folds=5, log=print):
 
     c["y"], c["score"] = y, score
     val_ids, test_ids = np.flatnonzero(part == 1), np.flatnonzero(part == 2)
-    f_val, t1, t2 = tune_policy(c[va], "score", n_true, val_ids, one_to_one=True)
-    sel = select_matches(c[pq == 2], "score", t1, t2, one_to_one=True)
+    # one-to-one over ALL Source 1 (every part and context competes for a Source 2/3 record, as at test time),
+    # then thresholds tuned / reported on the validation / held-out Source 1
+    g = c.loc[c.groupby("di")["score"].idxmax()]
+    gq = part[g["qi"].to_numpy()]
+    f_val, t1, t2 = tune_policy(g[gq == 1], "score", n_true, val_ids, one_to_one=False)
+    sel = select_matches(g[gq == 2], "score", t1, t2, one_to_one=False)
     f_test = macro_f05(sel, n_true, test_ids)
     # stage 1 alone, for reference
     c["s1score"] = clf1.predict_proba(X)[:, 1]
-    f1v, a1, a2 = tune_policy(c[va], "s1score", n_true, val_ids, one_to_one=True)
-    f1t = macro_f05(select_matches(c[pq == 2], "s1score", a1, a2, one_to_one=True), n_true, test_ids)
+    g1 = c.loc[c.groupby("di")["s1score"].idxmax()]
+    g1q = part[g1["qi"].to_numpy()]
+    f1v, a1, a2 = tune_policy(g1[g1q == 1], "s1score", n_true, val_ids, one_to_one=False)
+    f1t = macro_f05(select_matches(g1[g1q == 2], "s1score", a1, a2, one_to_one=False), n_true, test_ids)
     log(f"  held-out Macro F0.5: stage 1 = {f1t:.4f}, two-stage = {f_test:.4f} (tau1={t1:.2f}, tau2={t2:.2f})")
     imp = clf2.importance()
     return {"clf1": clf1, "clf2": clf2, "t1": t1, "t2": t2, "f05_val": f_val, "f05_test": f_test,
@@ -510,32 +596,41 @@ def train_two_stage(cands, X, y, n_true, s23p, seed=42, folds=5, log=print):
             "part": part, "pairs": c}
 
 
-def split_parts(n_s1, seed=42):
-    """Source 1 split used everywhere: 0 = fit (60%), 1 = early stopping + tuning (20%), 2 = held-out (20%)."""
+def split_parts(n_s1, seed=42, core=None):
+    """Source 1 split used everywhere: 0 = fit (60%), 1 = early stopping + tuning (20%), 2 = held-out (20%),
+    3 = context record (core == False)."""
     rng = np.random.default_rng(seed)
     perm = rng.permutation(n_s1)
     part = np.empty(n_s1, np.int8)
     part[perm[: int(0.6 * n_s1)]] = 0
     part[perm[int(0.6 * n_s1): int(0.8 * n_s1)]] = 1
     part[perm[int(0.8 * n_s1):]] = 2
+    if core is not None:
+        part[~np.asarray(core, bool)] = 3
     return part
 
 
-def fit_pipeline(cands_raw, s1p, s23p, y_raw, n_true, seed=42, log=print):
+def fit_pipeline(cands_raw, s1p, s23p, y_raw, n_true, seed=42, log=print, core=None):
     """Training entry point: prefilter (fit on the 60% part) -> pair features on kept candidates -> two stages.
+    core: optional bool per Source 1 (False = context record, see train_two_stage).
     Returns the model dict (with the prefilter) plus recall figures."""
     t0 = time.time()
-    part = split_parts(len(s1p), seed)
-    C = cheap_features(cands_raw, s1p, s23p)
+    part = split_parts(len(s1p), seed, core)
+    step = 4_000_000  # bounded peak memory: the string temporaries of the fast features are built per slice
+    C = pd.concat([cheap_features(cands_raw.iloc[i:i + step], s1p, s23p) for i in range(0, len(cands_raw), step)],
+                  ignore_index=True)
     pf, keep = train_prefilter(C, y_raw, part[cands_raw["qi"].to_numpy()], log=log)
     del C
     cands = cands_raw[keep].reset_index(drop=True).reindex(columns=["qi", "di"] + BLK_COLS + ["n_blockers"])
     y = np.asarray(y_raw)[keep].astype(np.int32)
-    rec_raw, rec = y_raw.sum() / max(n_true.sum(), 1), y.sum() / max(n_true.sum(), 1)
+    is_core = part < 3
+    cq_raw, cq = is_core[cands_raw["qi"].to_numpy()], is_core[cands["qi"].to_numpy()]
+    n_core = max(n_true[is_core].sum(), 1)
+    rec_raw, rec = np.asarray(y_raw)[cq_raw].sum() / n_core, y[cq].sum() / n_core
     log(f"  recall: blocking {rec_raw:.4f}, after prefilter {rec:.4f}; {len(cands):,} pairs ({time.time() - t0:.0f}s)")
     X = pair_features(cands, s1p, s23p, workers=-1)
     log(f"  pair features {X.shape} ({time.time() - t0:.0f}s)")
-    model = train_two_stage(cands, X, y, n_true, s23p, seed=seed, log=log)
+    model = train_two_stage(cands, X, y, n_true, s23p, seed=seed, log=log, core=core)
     model.update(prefilter=pf, recall_blocking=float(rec_raw), recall_prefilter=float(rec), n_train_pairs=len(cands))
     return model
 

@@ -104,7 +104,8 @@ STAGE2_BASE = ["name_tset", "name_wr", "core_tset", "core_exact", "addr_tset", "
                # address numbers, compact names, token differences, extra blocking views (extra_feats.py)
                "n_a", "n_b", "n_exact", "n_shift_up", "n_shift_down", "n_typo", "n_prefix", "n_a_left", "n_b_left",
                "h_delta", "h_lev", "h_eq", "h_prefix", "h_in_b", "n_minshift", "cmp_partial", "cmp_contain",
-               "tk_b_word", "tk_a_word", "tk_subst", "tk_b_oov_share", "blk_addr", "blk_rtext", "blk_rname"]
+               "tk_b_word", "tk_a_word", "tk_subst", "tk_b_oov_share", "blk_addr", "blk_rtext", "blk_rname",
+               "n_shift_up_mid", "n_shift_down_mid", "tk_extend", "tk_anagram", "tk_lev1"]
 
 
 def stage2_matrix(X1, p1, G1, G23):

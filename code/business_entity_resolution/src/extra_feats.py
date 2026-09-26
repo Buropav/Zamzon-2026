@@ -124,6 +124,8 @@ def _num_feats_impl(A, B, qi, di, out):
         down = 0
         typo = 0
         pref = 0
+        up_mid = 0
+        down_mid = 0
         minshift = 1000000
         for i in range(na):
             if useda[i]:
@@ -141,6 +143,10 @@ def _num_feats_impl(A, B, qi, di, out):
                     kind = 4
                 elif _lev_digits(a[i], b[j]) == 1:
                     kind = 3
+                elif 21 <= d <= 100:
+                    kind = 5
+                elif -100 <= d <= -21:
+                    kind = 6
                 if kind > 0:
                     usedb[j] = True
                     useda[i] = True
@@ -152,8 +158,12 @@ def _num_feats_impl(A, B, qi, di, out):
                         down += 1
                     elif kind == 3:
                         typo += 1
-                    else:
+                    elif kind == 4:
                         pref += 1
+                    elif kind == 5:
+                        up_mid += 1
+                    else:
+                        down_mid += 1
                     break
         a_left = 0
         for i in range(na):
@@ -187,13 +197,15 @@ def _num_feats_impl(A, B, qi, di, out):
             for c in range(9, 14):
                 out[r, c] = np.nan
         out[r, 14] = minshift if minshift != 1000000 else np.nan
+        out[r, 15] = up_mid
+        out[r, 16] = down_mid
 
 
 _num_feats = njit(_num_feats_impl)                    # serial: used inside forked feature workers
 _num_feats_par = njit(parallel=True)(_num_feats_impl)  # all cores: used in the parent (prefilter features)
 
 NUM_COLS = ["n_a", "n_b", "n_exact", "n_shift_up", "n_shift_down", "n_typo", "n_prefix", "n_a_left", "n_b_left",
-            "h_delta", "h_lev", "h_eq", "h_prefix", "h_in_b", "n_minshift"]
+            "h_delta", "h_lev", "h_eq", "h_prefix", "h_in_b", "n_minshift", "n_shift_up_mid", "n_shift_down_mid"]
 
 
 def num_features(NA, NB, qi, di, parallel=False):
@@ -246,7 +258,21 @@ def _similar(a, b):
 
 
 TOK_COLS = ["tk_a_n", "tk_b_n", "tk_common", "tk_b_typo", "tk_b_word", "tk_b_oov", "tk_a_typo", "tk_a_word",
-            "tk_a_oov", "tk_subst", "tk_b_oov_share"]
+            "tk_a_oov", "tk_subst", "tk_b_oov_share", "tk_extend", "tk_shorten", "tk_anagram", "tk_lev1", "tk_lev2"]
+
+
+def _edit_kind(a, b):
+    """Relation of a Source 1 word a to the Source 2/3 word b that replaced it. Training pairs: b = a + letters
+    ('suryanth' -> 'suryantha', a decoy mutation) is a match 15% of the time; same letters reordered (a typo of a
+    true copy) 85%; one edit 43-51%."""
+    if len(a) >= 3 and len(b) > len(a) and b.startswith(a) and len(b) - len(a) <= 3:
+        return 0
+    if len(b) >= 3 and len(a) > len(b) and a.startswith(b) and len(a) - len(b) <= 3:
+        return 1
+    if sorted(a) == sorted(b):
+        return 2
+    d = _Lev.distance(a, b)
+    return 3 if d == 1 else (4 if d == 2 else -1)
 
 
 def token_features(ca, cb, vocab):
@@ -273,6 +299,17 @@ def token_features(ca, cb, vocab):
                 aw += 1
             else:
                 ao += 1
+        kinds = [0, 0, 0, 0, 0]
+        for t in a_only:  # closest replacement word on the other side
+            best, bd = None, 99
+            for u in b_only:
+                d = _Lev.distance(t, u)
+                if d < bd:
+                    best, bd = u, d
+            if best is not None:
+                k = _edit_kind(t, best)
+                if k >= 0:
+                    kinds[k] += 1
         out[r] = (len(A), len(B), len(com), bt, bw, bo, at, aw, ao, float(bw > 0 and aw > 0),
-                  sum(t not in vocab for t in B) / max(len(B), 1))
+                  sum(t not in vocab for t in B) / max(len(B), 1), *kinds)
     return pd.DataFrame(out, columns=TOK_COLS)

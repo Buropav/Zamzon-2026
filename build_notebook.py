@@ -52,7 +52,8 @@ md("""
 - **Normalisation**: native-script names mapped word-for-word to Latin with a dictionary learned from the training
   ground truth; all Indic scripts + Urdu romanised otherwise; French ligatures/apostrophes, legal forms, landmarks,
   PIN/ZIP parsing, static per-country lexicon (cell 7). No API is called here.
-- **Training data**: every record of 10 whole regions (density preserved), split 60/20/20 by Source 1.
+- **Training data**: 10 whole regions (blocker region keys) + every unknown-region Source 2/3 record of the country,
+  i.e. the same pools the test set is blocked in; split 60/20/20 by Source 1.
 - **Blocking** per (country, state/region): char TF-IDF top-k forward (name, core name, name+address, address),
   reverse (each Source 2/3 record -> its best Source 1 records), and exact keys (house number + name).
 - **Prefilter**: small GBDT on blocking similarities + fast features drops ~90% of candidates, keeps ~99.98% of true pairs.
@@ -124,6 +125,7 @@ code("""
 DEV_MODE = False  # Set to False for complete 1.73M test submission run
 os.environ.setdefault("ER_USE_GPU", "1")      # GPU blocking (CPU fallback is automatic)
 os.environ.setdefault("ER_BACKEND", "auto")   # auto: XGBoost on GPU if present, else LightGBM
+USE_CONTEXT = False  # training: add owners of unknown-region Source 2/3 records as competitors (see sampling.py)
 
 IS_KAGGLE = Path("/kaggle/input").exists()
 WORKING_DIR = Path("/kaggle/working") if IS_KAGGLE else Path.cwd()
@@ -230,7 +232,7 @@ code(inline("two_stage.py"))
 code("""
 # [EXECUTION 1] Density-preserving training sample -> normalisation -> blocking -> two-stage GBDT (XGBoost on GPU)
 T0 = time.time()
-TRAIN_REGIONS = ("PUNJAB",) if DEV_MODE else DEFAULT_REGIONS
+TRAIN_REGIONS = ("PB",) if DEV_MODE else DEFAULT_REGION_KEYS
 print("Loading training data...")
 s1 = read_tsv(train_s1_path); s2 = read_tsv(train_s2_path); s3 = read_tsv(train_s3_path); gt = read_tsv(train_gt_path)
 # word-for-word native-script -> Latin map, learned from ALL training ground-truth pairs (training data only)
@@ -238,7 +240,11 @@ NATIVE_MAP = native_map_from_frames(s1, pd.concat([s2, s3], ignore_index=True), 
 print(f"Native-script map: {len(NATIVE_MAP['name']):,} name words, {len(NATIVE_MAP['addr'])} address components ({time.time()-T0:.0f}s)")
 # Source 1 name vocabulary (full table, like the full test Source 1 at inference)
 NAME_VOCAB = build_vocab(re.sub(r"[^a-z0-9]+", " ", str(x).lower()) for x in s1["business_name"])
-s1, s23, gt = region_sample(s1, s2, s3, gt, TRAIN_REGIONS)
+# whole regions by the blocker's region key + every unknown-region Source 2/3 record of the country (test-like pools)
+if DEV_MODE:  # smoke test: 10% of the records keeps every code path but runs in minutes on CPU
+    s2, s3 = s2.sample(frac=0.1, random_state=0), s3.sample(frac=0.1, random_state=0)
+S1_ALL, GT_ALL = s1, gt
+s1, s23, gt = region_sample_keys(S1_ALL, s2, s3, GT_ALL, TRAIN_REGIONS, n_jobs=N_JOBS, fork_map=_fork_map)
 del s2, s3; gc.collect()
 gt_dict = parse_gt(gt)
 print(f"Training regions {TRAIN_REGIONS}: S1={len(s1):,}, S23={len(s23):,}, true pairs={sum(map(len, gt_dict.values())):,}")
@@ -249,12 +255,21 @@ for k in ("singleton_share", "singleton_share_by_country", "s23_claimed_by_more_
 s1p = prepare_side(s1); s23p = prepare_side(s23)
 print(f"Prepared training tables ({time.time()-T0:.0f}s)")
 cands = block_candidates(s1p, s23p, log=print)
+core = None
+if USE_CONTEXT:
+    # owners (outside the sample) of the unknown-region Source 2/3 records the sample retrieved: scored as
+    # competitors like at test time (where every Source 1 is present), never trained on or evaluated
+    ctx, ctx_gt, ctx_di = context_owners(cands, s1p, s23p, S1_ALL, GT_ALL)
+    s1p, cands, core = add_context(s1p, s23p, cands, prepare_side(ctx), relevant_di=ctx_di, log=print)
+    gt_dict.update(parse_gt(ctx_gt))
+    del ctx, ctx_gt
+del S1_ALL, GT_ALL; gc.collect()
 s1_ids, s23_ids = s1p["entity_id"].to_numpy(), s23p["entity_id"].to_numpy()
 labels = np.array([s23_ids[d] in gt_dict.get(s1_ids[q], ()) for q, d in zip(cands.qi, cands.di)], np.int32)
 n_true = np.array([len(gt_dict.get(e, ())) for e in s1_ids])
 print(f"Blocked: {len(cands):,} pairs ({len(cands)/max(len(s1p),1):.1f} per Source 1)  ({time.time()-T0:.0f}s)")
 
-model = fit_pipeline(cands, s1p, s23p, labels, n_true)   # prefilter -> pair features -> two-stage GBDT
+model = fit_pipeline(cands, s1p, s23p, labels, n_true, core=core)   # prefilter -> pair features -> two-stage GBDT
 recall = model["recall_prefilter"]
 best_f05, t1, t2 = model["f05_test"], model["t1"], model["t2"]
 print("Top stage-2 features:", ", ".join(model["stage2_importance"].head(10).index))
@@ -282,7 +297,7 @@ test_s23p = prepare_side(test_s23, drop=SLIM)
 del test_s23; gc.collect()
 print(f"Prepared test tables ({time.time()-T1:.0f}s)")
 
-CHUNK_SIZE = 1_000 if DEV_MODE else 250_000
+CHUNK_SIZE = 1_000 if DEV_MODE else 100_000   # Source 1 per chunk (bounds peak memory of the prefilter features)
 test_cands, test_sel = predict_chunked(test_s1p, test_s23p, model, chunk_size=CHUNK_SIZE,
                                        cache_dir=str(WORKING_DIR / "stage2_cache"))
 

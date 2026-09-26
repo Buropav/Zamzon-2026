@@ -31,8 +31,8 @@ from src.features import prepare_side  # noqa: E402
 from src.extra_feats import build_vocab  # noqa: E402
 from src.translit import native_map_from_frames  # noqa: E402
 from src.metrics import parse_gt, gt_diagnostics  # noqa: E402
-from src.sampling import region_sample, DEFAULT_REGIONS  # noqa: E402
-from src.two_stage import block_candidates, fit_pipeline, predict_chunked, id_lists  # noqa: E402
+from src.sampling import region_sample_keys, context_owners, DEFAULT_REGION_KEYS  # noqa: E402
+from src.two_stage import block_candidates, add_context, fit_pipeline, predict_chunked, id_lists  # noqa: E402
 
 
 def main(a):
@@ -47,7 +47,8 @@ def main(a):
     FE.NATIVE_MAP = native_map_from_frames(s1, pd.concat([s2, s3], ignore_index=True), gt)
     FE.NAME_VOCAB = build_vocab(re.sub(r"[^a-z0-9]+", " ", str(x).lower()) for x in s1["business_name"])
     log(f"  native-script map: {len(FE.NATIVE_MAP['name']):,} words; name vocabulary {len(FE.NAME_VOCAB):,}")
-    s1, s23, gt = region_sample(s1, s2, s3, gt, a.regions)
+    s1_all, gt_all = s1, gt
+    s1, s23, gt = region_sample_keys(s1_all, s2, s3, gt_all, a.regions, n_jobs=FE.N_JOBS, fork_map=FE._fork_map, log=log)
     del s2, s3
     gt_dict = parse_gt(gt)
     log(f"  S1={len(s1):,} S23={len(s23):,} true pairs={sum(map(len, gt_dict.values())):,}")
@@ -56,13 +57,18 @@ def main(a):
     log("[2/5] Normalisation, blocking...")
     s1p, s23p = prepare_side(s1), prepare_side(s23)
     cands = block_candidates(s1p, s23p, log=log)
+    # owners of the unknown-region Source 2/3 records the sample retrieved: competitors, never trained on
+    ctx, ctx_gt, ctx_di = context_owners(cands, s1p, s23p, s1_all, gt_all)
+    s1p, cands, core = add_context(s1p, s23p, cands, prepare_side(ctx), relevant_di=ctx_di, log=log)
+    gt_dict.update(parse_gt(ctx_gt))
+    del s1_all, gt_all, ctx, ctx_gt
     s1_ids, s23_ids = s1p["entity_id"].to_numpy(), s23p["entity_id"].to_numpy()
     y = np.array([s23_ids[d] in gt_dict.get(s1_ids[q], ()) for q, d in zip(cands.qi, cands.di)], np.int32)
     n_true = np.array([len(gt_dict.get(e, ())) for e in s1_ids])
-    log(f"  candidates={len(cands):,}  blocking recall={y.sum() / max(n_true.sum(), 1):.4f}")
+    log(f"  candidates={len(cands):,} (incl. context owners)")
 
     log("[3/5] Prefilter, pair features, two-stage GBDT...")
-    model = fit_pipeline(cands, s1p, s23p, y, n_true, log=log)
+    model = fit_pipeline(cands, s1p, s23p, y, n_true, log=log, core=core)
     recall = model["recall_prefilter"]
     del cands, s1p, s23p
 
@@ -109,8 +115,8 @@ if __name__ == "__main__":
     ap.add_argument("--train-dir", default="dataset/train")
     ap.add_argument("--test-dir", default="dataset/test")
     ap.add_argument("--output-dir", default="output")
-    ap.add_argument("--regions", nargs="+", default=list(DEFAULT_REGIONS))
-    ap.add_argument("--chunk-size", type=int, default=250_000)
+    ap.add_argument("--regions", nargs="+", default=list(DEFAULT_REGION_KEYS))
+    ap.add_argument("--chunk-size", type=int, default=100_000)
     ap.add_argument("--validator", default=None)
     ap.add_argument("--dev", action="store_true")
     main(ap.parse_args())

@@ -49,3 +49,79 @@ def region_sample(s1, s2, s3, gt, regions=DEFAULT_REGIONS):
     parts = [d[_mask(d, regions) | d["entity_id"].isin(need)] for d in (s2, s3)]
     s23 = pd.concat(parts, ignore_index=True).drop_duplicates("entity_id").reset_index(drop=True)
     return s1r, s23, gtr
+
+
+# ------------------------------------------------------------------ test-like pools (region keys)
+# The blocker searches each Source 1 record in its (country, region) pool, and Source 2/3 records whose region is
+# unknown (mostly EMPTY addresses) join every regional pool of their country. A training sample must look the
+# same: whole regions by the blocker's own region key, plus ALL unknown-region Source 2/3 records of the country.
+# Without them, an empty-address record only appears in training when it is a true match of a sampled Source 1,
+# so the model learns "empty address + similar name = match" and over-matches at test time (measured on the
+# Karnataka pool: 89% of false positives were empty-address records owned by a Source 1 in another state).
+DEFAULT_REGION_KEYS = ("OR", "KY", "AR", "MO", "WI", "NC", "KL", "PB", "HR", "OD", "RJ", "KA")  # incl. two dense ones
+
+
+def _region_keys_task(args):
+    # <package-only>
+    from .geo import region_key
+    from .er_multilingual import normalize_ml
+    from .text import canon_country
+    # </package-only>
+    countries, addrs = args
+    return [region_key(canon_country(c), normalize_ml(a, "addr"), a) for c, a in zip(countries, addrs)]
+
+
+def region_keys(df, n_jobs=None, fork_map=None):
+    """Blocker region key of every record (parallel over CPU cores when fork_map is given)."""
+    import numpy as np
+    parts = np.array_split(np.arange(len(df)), max(1, (n_jobs or 1) * 8))
+    items = [(df["country"].to_numpy()[i], df["business_address"].fillna("").to_numpy()[i]) for i in parts]
+    res = fork_map(_region_keys_task, items, n_jobs) if fork_map and (n_jobs or 1) > 1 else [_region_keys_task(x) for x in items]
+    return np.array([k for r in res for k in r], dtype=object)
+
+
+def region_sample_keys(s1, s2, s3, gt, regions=DEFAULT_REGION_KEYS, n_jobs=None, fork_map=None, log=print):
+    """(s1, s23, gt): Source 1 of the given region keys; Source 2/3 of those regions, every unknown-region
+    Source 2/3 record of the same countries, and all ground-truth matches of the chosen Source 1."""
+    import numpy as np
+    r1 = region_keys(s1, n_jobs, fork_map)
+    s1r = s1[np.isin(r1, regions)].reset_index(drop=True)
+    ctry = set(s1r["country"])
+    ids = set(s1r["entity_id"])
+    gtr = gt[gt.iloc[:, 0].isin(ids)].copy()
+    need = {x.strip() for m in gtr.iloc[:, 1].fillna("") for x in str(m).split(",") if x.strip()}
+    parts = []
+    for d in (s2, s3):
+        r = region_keys(d, n_jobs, fork_map)
+        keep = np.isin(r, regions) | ((r == "") & d["country"].isin(ctry).to_numpy()) | d["entity_id"].isin(need).to_numpy()
+        parts.append(d[keep])
+    s23 = pd.concat(parts, ignore_index=True).drop_duplicates("entity_id").reset_index(drop=True)
+    if log:
+        log(f"  region sample {regions}: S1={len(s1r):,} S23={len(s23):,}")
+    return s1r, s23, gtr
+
+
+def context_owners(cands, s1p, s23p, s1_all, gt_all, min_name=0.8):
+    """Source 1 records OUTSIDE the sample that own an unknown-region Source 2/3 record which some sampled
+    Source 1 resembles by name (token-set ratio >= min_name, i.e. a real impostor threat). At test time every
+    Source 1 of the country is present, so an empty-address record competes with its true owner; adding the
+    owners as context records (scored, never trained on) gives training the same competition.
+    -> (owners DataFrame, their ground-truth rows, positions in s23p of the relevant Source 2/3 records)."""
+    import numpy as np
+    from rapidfuzz import fuzz
+    from rapidfuzz.process import cpdist
+    unk = s23p["region"].to_numpy(object) == ""
+    q, d = cands["qi"].to_numpy(), cands["di"].to_numpy()
+    m = unk[d]
+    q, d = q[m], d[m]
+    sim = cpdist(s1p["norm_name"].to_numpy()[q], s23p["norm_name"].to_numpy()[d], scorer=fuzz.token_set_ratio,
+                 workers=-1, dtype=np.float32) / 100.0
+    di = np.unique(d[sim >= min_name])
+    rset = set(s23p["entity_id"].to_numpy()[di])
+    g = gt_all.iloc[:, 1].fillna("").astype(str).str.split(",")
+    ex = pd.DataFrame({"a": gt_all.iloc[:, 0].to_numpy(), "b": g}).explode("b")
+    ex = ex[ex["b"].isin(rset)]
+    owners = set(ex["a"]) - set(s1p["entity_id"])
+    ctx = s1_all[s1_all["entity_id"].isin(owners)].reset_index(drop=True)
+    ctx_gt = gt_all[gt_all.iloc[:, 0].isin(owners)]
+    return ctx, ctx_gt, di

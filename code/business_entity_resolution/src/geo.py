@@ -16,7 +16,7 @@ _IN = {
     "MH": "maharashtra mh mumbai bombay pune poona thane nagpur nashik navi aurangabad kalyan vasai solapur kolhapur",
     "DL": "delhi dilli dl",
     "KA": "karnataka ka bangalore bengaluru mysore mysuru mangalore hubli belgaum",
-    "TN": "tn tamilnadu chennai madras coimbatore madurai tiruchirappalli trichy salem tiruppur",
+    "TN": "tn tamilnadu tamil chennai madras coimbatore madurai tiruchirappalli trichy salem tiruppur",
     "WB": "wb bengal pashchimavanga kolkata calcutta howrah durgapur siliguri",
     "UP": "up uttar lucknow noida ghaziabad kanpur agra varanasi meerut allahabad prayagraj",
     "GJ": "gujarat gj gujarata ahmedabad surat vadodara baroda rajkot gandhinagar",
