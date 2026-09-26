@@ -80,24 +80,47 @@ def region_keys(df, n_jobs=None, fork_map=None):
     return np.array([k for r in res for k in r], dtype=object)
 
 
-def region_sample_keys(s1, s2, s3, gt, regions=DEFAULT_REGION_KEYS, n_jobs=None, fork_map=None, log=print):
-    """(s1, s23, gt): Source 1 of the given region keys; Source 2/3 of those regions, every unknown-region
-    Source 2/3 record of the same countries, and all ground-truth matches of the chosen Source 1."""
+def region_sample_keys(s1, s2, s3, gt, regions=DEFAULT_REGION_KEYS, n_jobs=None, fork_map=None, log=print,
+                       orphan_frac=0.0, seed=0):
+    """Test-like training sample -> (s1, s23, gt).
+
+    Source 1: every record of the given region keys. Source 2/3: the records of those regions, the true matches
+    of the chosen Source 1 wherever they are, and never-matched unknown-region records of the same countries at
+    the sample's share of the country (so the sample has the full dataset's mix; an unknown-region record owned
+    by a Source 1 OUTSIDE the sample would look unmatched here although its owner competes for it at test time).
+
+    orphan_frac: share of the chosen Source 1 then REMOVED, their Source 2/3 records kept as unmatched
+    distractors. Test Source 2/3 records are ~40% unmatched vs ~26% in train (5.8 vs 4.7 records per Source 1
+    with the same records per business), i.e. ~19% of the businesses have no Source 1 record in test."""
     import numpy as np
     r1 = region_keys(s1, n_jobs, fork_map)
     s1r = s1[np.isin(r1, regions)].reset_index(drop=True)
     ctry = set(s1r["country"])
+    share = (s1r["country"].value_counts() / s1["country"].value_counts()).dropna().to_dict()
     ids = set(s1r["entity_id"])
     gtr = gt[gt.iloc[:, 0].isin(ids)].copy()
     need = {x.strip() for m in gtr.iloc[:, 1].fillna("") for x in str(m).split(",") if x.strip()}
+    owned = pd.Index(gt.iloc[:, 1].fillna("").astype(str).str.split(",").explode().str.strip().unique())
+    rng = np.random.default_rng(seed)
     parts = []
     for d in (s2, s3):
         r = region_keys(d, n_jobs, fork_map)
-        keep = np.isin(r, regions) | ((r == "") & d["country"].isin(ctry).to_numpy()) | d["entity_id"].isin(need).to_numpy()
+        c = d["country"].to_numpy(object)
+        lottery = rng.random(len(d)) < d["country"].map(share).fillna(0.0).to_numpy(float)
+        unmatched = ~d["entity_id"].isin(owned).to_numpy()
+        keep = (np.isin(r, regions) | d["entity_id"].isin(need).to_numpy()
+                | ((r == "") & np.isin(c, list(ctry)) & unmatched & lottery))
         parts.append(d[keep])
     s23 = pd.concat(parts, ignore_index=True).drop_duplicates("entity_id").reset_index(drop=True)
+    if orphan_frac > 0:
+        drop = np.random.default_rng(seed + 1).random(len(s1r)) < orphan_frac
+        s1r = s1r[~drop].reset_index(drop=True)
+        gtr = gtr[gtr.iloc[:, 0].isin(set(s1r["entity_id"]))].copy()
     if log:
-        log(f"  region sample {regions}: S1={len(s1r):,} S23={len(s23):,}")
+        mine = {x.strip() for m in gtr.iloc[:, 1].fillna("") for x in str(m).split(",") if x.strip()}
+        unm = 1 - s23["entity_id"].isin(mine).mean()
+        log(f"  region sample {regions}: S1={len(s1r):,} S23={len(s23):,} (orphaned {orphan_frac:.0%} of Source 1; "
+            f"Source 2/3 without a Source 1 match: {unm:.1%}, test ~40%)")
     return s1r, s23, gtr
 
 

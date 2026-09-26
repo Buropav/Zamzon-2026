@@ -115,7 +115,7 @@ print(f"CPU cores: {os.cpu_count()} -> text cleaning and pair features run in pa
 # Cell 2: Imports
 code("""
 # [SETUP 2] Standard Imports
-import os, sys, csv, time, json, zipfile, re, unicodedata, subprocess, gc
+import os, sys, csv, time, json, zipfile, re, unicodedata, subprocess, gc, shutil
 from pathlib import Path
 from collections import Counter
 
@@ -147,6 +147,9 @@ os.environ.setdefault("ER_USE_GPU", "1")      # GPU blocking (CPU fallback is au
 os.environ.setdefault("ER_BACKEND", "xgb")    # XGBoost for the prefilter and both stages (CUDA on the GPU)
 USE_GLOBAL_NAMES = False  # country-wide name competition for unknown-region records (global_names.py)
 USE_CONTEXT = False  # training: add owners of unknown-region Source 2/3 records as competitors (see sampling.py)
+# test Source 2/3 records are ~40% unmatched (business absent from Source 1) vs ~26% in train: removing 19% of the
+# training Source 1 (their Source 2/3 records stay as distractors) gives training and tuning the test's density
+ORPHAN_FRAC = 0.19
 
 IS_KAGGLE = Path("/kaggle/input").exists()
 WORKING_DIR = Path("/kaggle/working") if IS_KAGGLE else Path.cwd()
@@ -265,7 +268,8 @@ NAME_VOCAB = build_vocab(re.sub(r"[^a-z0-9]+", " ", str(x).lower()) for x in s1[
 if DEV_MODE:  # smoke test: 10% of the records keeps every code path but runs in minutes on CPU
     s2, s3 = s2.sample(frac=0.1, random_state=0), s3.sample(frac=0.1, random_state=0)
 S1_ALL, GT_ALL = s1, gt
-s1, s23, gt = region_sample_keys(S1_ALL, s2, s3, GT_ALL, TRAIN_REGIONS, n_jobs=N_JOBS, fork_map=_fork_map)
+s1, s23, gt = region_sample_keys(S1_ALL, s2, s3, GT_ALL, TRAIN_REGIONS, n_jobs=N_JOBS, fork_map=_fork_map,
+                                 orphan_frac=ORPHAN_FRAC)
 del s2, s3; gc.collect()
 gt_dict = parse_gt(gt)
 print(f"Training regions {TRAIN_REGIONS}: S1={len(s1):,}, S23={len(s23):,}, true pairs={sum(map(len, gt_dict.values())):,}")
@@ -303,8 +307,10 @@ model = fit_pipeline(cands, s1p, s23p, labels, n_true, core=core, gnames=GN_TRAI
 recall = model["recall_prefilter"]
 best_f05, t1, t2 = model["f05_test"], model["t1"], model["t2"]
 print("Top stage-2 features:", ", ".join(model["stage2_importance"].head(10).index))
-del cands, s1p, s23p, s1, s23, gt, GN_TRAIN, Q_FULL; gc.collect()
-print(f"Training done in {time.time()-T0:.0f}s")
+model.pop("pairs", None); model.pop("part", None)   # training-only arrays
+del cands, s1p, s23p, s1, s23, gt, gt_dict, GN_TRAIN, Q_FULL, labels, n_true
+release_memory()
+print(f"Training done in {time.time()-T0:.0f}s ({mem_info()})")
 """)
 
 # Cell 15: Test inference
@@ -321,27 +327,28 @@ print(f"Test: S1={len(test_s1):,}, S23={len(test_s23):,}")
 print("Countries:", test_s1["country"].value_counts().to_dict())
 
 NAME_VOCAB = build_vocab(re.sub(r"[^a-z0-9]+", " ", str(x).lower()) for x in test_s1["business_name"])
+ts1_ids, ts23_ids = test_s1["entity_id"].to_numpy(), test_s23["entity_id"].to_numpy()
+ts1_country = test_s1["country"].map(canon_country).to_numpy(object)
+n_test_s1 = len(test_s1)
+# one country at a time: candidates never cross countries, and the whole test set prepared at once does not fit
+# in 30 GB (~1.7 kB per prepared record x 11.7M records + the raw tables); the raw rows wait on disk meanwhile
+TEST_PARTS = split_by_country(test_s1, test_s23, str(WORKING_DIR / "test_by_country"))
+del test_s1, test_s23
+release_memory()
+print(f"Test tables split by country ({time.time()-T1:.0f}s, {mem_info()})")
+
 SLIM = ("business_name", "business_address", "ml_addr")   # raw text not needed after cleaning
-test_s1p = prepare_side(test_s1, drop=SLIM)
-test_s23p = prepare_side(test_s23, drop=SLIM)
-del test_s23; gc.collect()
-print(f"Prepared test tables ({time.time()-T1:.0f}s)")
-
-# blocking time projected from the speed measured on the training regions; optional views are dropped if the
-# projection exceeds the budget, so the run always finishes inside the 12 h Kaggle session
+# blocking time is projected per country from the speed measured on the training regions; optional views are
+# dropped if a projection exceeds what is left of the budget, so the run always finishes inside 12 h
 TEST_BLOCK_BUDGET_S = 3 * 3600
-project_blocking(test_s1p, test_s23p, budget_s=TEST_BLOCK_BUDGET_S)
-print(f"Elapsed since start: {(time.time() - T0) / 60:.0f} min")
 CHUNK_SIZE = 1_000 if DEV_MODE else 100_000   # Source 1 per chunk (bounds peak memory of the prefilter features)
-GN_TEST = None
-if model.get("uses_gnames"):
-    GN_TEST = GlobalNames(test_s1p["norm_name"].to_numpy(object), test_s1p["country"].to_numpy(object), test_s23p,
-                          lambda Q, DT, k, ms: _topk_any(Q, DT, k, ms, _gpu()))
-    print(f"Global name competition ready ({(time.time() - T1) / 60:.0f} min)")
-test_cands, test_sel = predict_chunked(test_s1p, test_s23p, model, chunk_size=CHUNK_SIZE, gnames=GN_TEST,
-                                       cache_dir=str(WORKING_DIR / "stage2_cache"))
+make_gn = (lambda s1p_, s23p_: GlobalNames(s1p_["norm_name"].to_numpy(object), s1p_["country"].to_numpy(object), s23p_,
+                                            lambda Q, DT, k, ms: _topk_any(Q, DT, k, ms, _gpu())))
+test_cands, test_sel = predict_by_country(TEST_PARTS, model, lambda df: prepare_side(df, drop=SLIM),
+                                          chunk_size=CHUNK_SIZE, cache_dir=str(WORKING_DIR / "stage2_cache"),
+                                          block_budget_s=TEST_BLOCK_BUDGET_S, make_gnames=make_gn)
+shutil.rmtree(WORKING_DIR / "test_by_country", ignore_errors=True)
 
-ts1_ids, ts23_ids = test_s1p["entity_id"].to_numpy(), test_s23p["entity_id"].to_numpy()
 cand_out = pd.DataFrame({"source1_entity_id": ts1_ids,
                          "candidate_entity_ids": id_lists(len(ts1_ids), test_cands.qi.to_numpy(), test_cands.di.to_numpy(), ts23_ids)})
 match_out = pd.DataFrame({"source1_entity_id": ts1_ids,
@@ -351,12 +358,12 @@ match_file = OUTPUT_DIR / "matching_results.tsv"
 cand_out.to_csv(cand_file, sep="\\t", index=False)
 match_out.to_csv(match_file, sep="\\t", index=False)
 
-assert len(match_out) == len(test_s1) and match_out["source1_entity_id"].is_unique
-assert len(cand_out) == len(test_s1)
+assert len(match_out) == n_test_s1 and match_out["source1_entity_id"].is_unique
+assert len(cand_out) == n_test_s1
 n_matched = (match_out["matched_entity_ids"] != "").sum()
 print(f"Saved {match_file.name}: {len(match_out):,} rows, {n_matched:,} non-empty")
 print(f"Saved {cand_file.name}: {len(cand_out):,} rows, {len(test_cands):,} candidate pairs")
-print("Non-empty share by country:", (match_out["matched_entity_ids"] != "").groupby(test_s1p["country"].to_numpy()).mean().round(3).to_dict())
+print("Non-empty share by country:", (match_out["matched_entity_ids"] != "").groupby(ts1_country).mean().round(3).to_dict())
 print(f"Inference done in {time.time()-T1:.0f}s")
 """)
 
@@ -366,13 +373,16 @@ code("""
 metrics_data = {
     "heldout_macro_f05_two_stage": round(float(model["f05_test"]), 4),
     "heldout_macro_f05_stage1_only": round(float(model["f05_test_stage1"]), 4),
-    "tau1": round(float(t1), 2), "tau2": round(float(t2), 2),
+    "tau1": round(float(t1), 2), "tau2": round(float(t2), 2), "decision_rule": model.get("policy"),
+    "heldout_f05_thresholds_rule": round(float(model["f05_test_thresholds"]), 4),
+    "heldout_f05_expected_f_rule": round(float(model["f05_test_expected_f"]), 4),
+    "orphan_frac": ORPHAN_FRAC,
     "train_blocking_recall": round(float(model["recall_blocking"]), 4),
     "train_recall_after_prefilter": round(float(model["recall_prefilter"]), 4),
     "train_pairs_after_prefilter": int(model["n_train_pairs"]),
     "train_regions": list(TRAIN_REGIONS),
     "model_backend": resolve_backend(), "xgboost_device": _xgb_device(), "gpu_blocking": _gpu() is not None,
-    "test_s1_count": len(test_s1), "test_candidate_pairs": int(len(test_cands)), "test_matches": int(len(test_sel)),
+    "test_s1_count": n_test_s1, "test_candidate_pairs": int(len(test_cands)), "test_matches": int(len(test_sel)),
     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
 }
 with open(WORKING_DIR / "metrics.json", "w") as f:
@@ -404,7 +414,8 @@ record -> its top Source 1 records: name+address 3, name 2, address 2) and exact
 prefix, house number + compact name). On a test-sized Indian pool (Karnataka) recall rose from 0.940 (old
 3-view forward blocking) to 0.982. A small GBDT prefilter on blocking similarities and fast features then keeps
 ~10% of the candidates and ~99.98% of the true pairs.
-Test: {len(test_cands):,} candidate pairs (after the prefilter) for {len(test_s1):,} Source 1 entities.
+Test: {len(test_cands):,} candidate pairs (after the prefilter) for {n_test_s1:,} Source 1 entities, processed one
+country at a time (candidates never cross countries), which bounds memory by the largest country.
 
 ## 3. Matching model
 - Stage 1: {_backend_name} on ~88 pair features: fuzzy name/core/address ratios, IDF cosines, phonetic keys,
@@ -417,10 +428,18 @@ Test: {len(test_cands):,} candidate pairs (after the prefilter) for {len(test_s1
   support from other candidates at the same address / with the same house number. Out-of-fold stage-1 scores.
 - Training data: every record of whole regions ({', '.join(TRAIN_REGIONS)}); split by Source 1:
   60% fit / 20% early stopping + threshold tuning / 20% held-out report.
+- Test-like distractor density: test Source 2/3 records are ~40% unmatched (their business has no Source 1
+  record) against ~26% in train (5.8 vs 4.7 Source 2/3 records per Source 1, with the same number of records per
+  business). {ORPHAN_FRAC:.0%} of the sampled Source 1 are removed and their Source 2/3 records kept as distractors,
+  so the model and the decision thresholds are fitted at the test's density. Unknown-region Source 2/3 records
+  are sampled by owner (the chosen Source 1's records plus never-matched ones at the sample's share).
 
 ## 4. Decision policy
-tau1 = {t1:.2f} (best candidate), tau2 = {t2:.2f} (additional candidates); each Source 2/3 record is assigned
-to at most one Source 1 entity (global one-to-one, matching the ground-truth structure).
+Each Source 2/3 record is assigned to at most one Source 1 entity (global one-to-one, matching the ground-truth
+structure). Two rules are tuned on the tuning part and the better one is kept: two thresholds (tau1 = {t1:.2f}
+for the best candidate, tau2 = {t2:.2f} for additional ones; held-out {model['f05_test_thresholds']:.4f}) and an
+expected-F0.5 set rule (per Source 1, the top-k maximising the expected F0.5 of the calibrated probabilities;
+held-out {model['f05_test_expected_f']:.4f}). Used: {model.get('policy')}.
 \"\"\"
 doc_path = WORKING_DIR / "methodology_document.md"
 doc_path.write_text(methodology_content, encoding="utf-8")

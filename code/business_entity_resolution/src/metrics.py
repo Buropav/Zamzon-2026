@@ -76,3 +76,53 @@ def tune_policy(df, score_col, n_true, s1_ids, one_to_one=True,
             if f > best[0]:
                 best = (f, float(t1), float(t2))
     return best
+
+
+def select_expected_f(df, score_col, miss=0.0, empty_bias=1.0, floor=0.05):
+    """Per Source 1, the top-k candidates (k >= 0) that maximise the expected F0.5 given calibrated match
+    probabilities p_1 >= p_2 >= ... (df must already be one-to-one):
+        E[F](k) ~ 1.25 * (p_1 + .. + p_k) / (0.25 * (sum(p) + miss) + k),   E[F](empty) ~ prod(1 - p_i) * empty_bias
+    miss: expected true matches outside the candidate list; empty_bias scales the value of predicting nothing.
+    Candidates below `floor` are ignored."""
+    d = df[df[score_col] >= floor]
+    if d.empty:
+        return d
+    q0 = d["qi"].to_numpy()
+    d = d.iloc[np.lexsort((-d[score_col].to_numpy(), q0))]
+    q, p = d["qi"].to_numpy(), d[score_col].to_numpy(np.float64)
+    starts = np.flatnonzero(np.r_[True, q[1:] != q[:-1]])
+    lens = np.diff(np.r_[starts, len(q)])
+    grp = np.repeat(np.arange(len(starts)), lens)
+    k = np.arange(len(q)) - starts[grp] + 1
+    cum = np.r_[0.0, np.cumsum(p)]
+    tp = cum[1:] - cum[starts][grp]
+    tot = (cum[starts + lens] - cum[starts])[grp]
+    ef = 1.25 * tp / (0.25 * (tot + miss) + k)
+    e_empty = np.exp(np.add.reduceat(np.log1p(-np.clip(p, 0.0, 1 - 1e-9)), starts)) * empty_bias
+    best = np.maximum.reduceat(ef, starts)
+    k_best = np.minimum.reduceat(np.where(ef >= best[grp], k, len(q) + 1), starts)
+    k_best = np.where(best > e_empty, k_best, 0)
+    return d[k <= k_best[grp]]
+
+
+def tune_expected_f(df, score_col, n_true, s1_ids, misses=(0.0, 0.2, 0.5), biases=(0.8, 1.0, 1.25),
+                    floors=(0.02, 0.05, 0.1)):
+    """Grid search of select_expected_f on validation data (df already one-to-one) -> (F0.5, policy dict)."""
+    best = (-1.0, None)
+    for m in misses:
+        for b in biases:
+            for fl in floors:
+                f = macro_f05(select_expected_f(df, score_col, m, b, fl), n_true, s1_ids)
+                if f > best[0]:
+                    best = (f, {"rule": "expected_f", "miss": float(m), "empty_bias": float(b), "floor": float(fl)})
+    return best
+
+
+def select_policy(df, score_col, policy, one_to_one=True):
+    """Applies a decision policy: {"rule": "thresholds", t1, t2} or {"rule": "expected_f", miss, empty_bias, floor}."""
+    if policy.get("rule", "thresholds") == "thresholds":
+        return select_matches(df, score_col, policy["t1"], policy["t2"], one_to_one)
+    if df.empty:
+        return df
+    d = df.loc[df.groupby("di")[score_col].idxmax()] if one_to_one else df
+    return select_expected_f(d, score_col, policy["miss"], policy["empty_bias"], policy["floor"])

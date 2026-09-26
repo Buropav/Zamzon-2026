@@ -12,8 +12,9 @@ Source 2/3 names are mapped back to English with a word map learned from the tra
 from forward, reverse and exact-key blocking inside state/region pools; a small GBDT prefilter drops ~90% of them;
 a pair classifier with generator-aware features (address-number alignment that separates the planted "decoy"
 records from true copies) is followed by a second model that sees the whole candidate group; matches are selected
-with two F0.5-tuned thresholds under a global one-to-one constraint. Training pools are built exactly like test
-pools. Held-out macro F0.5 on whole training regions: **{{HELDOUT_F05}}**.
+under a global one-to-one constraint with an F0.5-tuned decision rule. Training pools are built like test pools,
+including the test's higher share of distractor records (Source 2/3 records whose business has no Source 1
+record). Held-out macro F0.5 on whole training regions at test-like distractor density: **{{HELDOUT_F05}}**.
 
 ---
 
@@ -37,6 +38,11 @@ pools. Held-out macro F0.5 on whole training regions: **{{HELDOUT_F05}}**.
 - **Addresses:** state code vs name, reordered components, landmarks, placeholders ("null"), empty addresses
   (2.6-3.4%). 97.7% of empty-address records are true copies of some Source 1.
 - **France** (15% of test Source 1) has no training labels; generator-aware features are language-independent.
+- **Distractor density differs between train and test:** test has 5.8 Source 2/3 records per Source 1 against 4.7
+  in train, with the same number of records per business (exact-name Source 2/3 per unique-name Source 1: 1.03 in
+  both US splits, 0.71 / 0.73 in India), while the share of Source 2/3 records with any same-name Source 1 drops by
+  0.81x (US). So ~19% of the businesses have no Source 1 record in test and ~40% of test Source 2/3 records are
+  unmatched distractors, against 26% in train. Training at train density under-weights precision.
 - **Scale and density:** test regional pools are large (Maharashtra: 180k Source 1 x 1.3M Source 2/3). Held-out
   scores on small training regions are optimistic: a model scoring 0.989 on a small-region held-out scored 0.975
   on the whole Karnataka pool (68.8k Source 1, never seen in training, with the true owners of all shared records present).
@@ -46,8 +52,8 @@ pools. Held-out macro F0.5 on whole training regions: **{{HELDOUT_F05}}**.
 **Core Innovation:** (1) generator-aware features (address-number alignment, word-edit classes) that separate
 decoys from true copies; (2) reverse and exact-key blocking that keep recall high in dense test-sized pools, made
 affordable by a GBDT prefilter; (3) training pools built like test pools (whole regions by the blocker's own region
-key, every unknown-region Source 2/3 record of the country, and the true owners of those records as context);
-(4) a learned native-script -> English word map.
+key, owner-sampled unknown-region records) at the TEST's distractor density (19% of the training Source 1
+removed, their Source 2/3 records kept as distractors); (4) a learned native-script -> English word map.
 
 ---
 
@@ -97,14 +103,21 @@ with the same house number (true copies share the Source 1 number; a decoy's shi
 
 **Model type:** {{BACKEND}} gradient-boosted trees for the prefilter and both stages (XGBoost, Apache-2.0, on GPU;
 LightGBM, MIT, on CPU-only machines).  
-**Training data:** 12 whole regions by the blocker's region key (US: OR, KY, AR, MO, WI, NC; India: KL, PB, HR,
-OD, RJ, KA) + every unknown-region Source 2/3 record of both countries + the true owners (from other regions) of
-the unknown-region records the sample retrieved, added as context: scored and used as competitors in the group
-features and the one-to-one assignment, never trained on or evaluated. Split by Source 1 entity 60% fit / 20%
-early stopping + threshold tuning / 20% held-out report.  
+**Training data:** 8 whole regions by the blocker's region key (US: OR, KY, AR, NC; India: KL, PB, HR, KA): all
+their Source 1 and Source 2/3 records, the true matches of those Source 1 wherever they are, and never-matched
+unknown-region Source 2/3 records at the sample's share of the country (an unknown-region record owned by a Source 1
+outside the sample would look unmatched although its owner competes for it at test time). Then 19% of the sampled
+Source 1 are removed and their Source 2/3 records kept as distractors, which brings the unmatched share of Source
+2/3 records from 26% to the test's ~40%. Split by Source 1 entity 60% fit / 20% early stopping + decision tuning /
+20% held-out report.  
 **Threshold selection method:** global one-to-one assignment (each Source 2/3 record goes to the Source 1 entity
-that scores it highest), then grid search of two thresholds on the tuning split with the exact entity-level
-macro F0.5 (singletons included): tau1 = {{TAU1}} for each entity's best candidate, tau2 = {{TAU2}} for the others.
+that scores it highest), then two decision rules tuned on the tuning split with the exact entity-level macro F0.5
+(singletons included), the better one kept: two thresholds (tau1 = {{TAU1}} for each entity's best candidate,
+tau2 = {{TAU2}} for the others) and an expected-F0.5 set rule (per entity, the top-k candidates maximising the
+expected F0.5 of the calibrated stage-2 probabilities, or none when "no match" is more likely to score).  
+**Inference:** one country at a time (blocking pools, TF-IDF fits and group features never cross countries), so
+peak memory is set by the largest country; the one-to-one assignment and the decision rule then run on all
+countries' scores together.
 
 **Preprocessing resources:** (1) the native-script word map is learned at run time from the training ground truth
 (1.3k words, 98.9% purity, 96% token coverage of test native-script names); (2) the static lexicon in

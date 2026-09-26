@@ -14,6 +14,7 @@ Usage:
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -32,7 +33,8 @@ from src.extra_feats import build_vocab  # noqa: E402
 from src.translit import native_map_from_frames  # noqa: E402
 from src.metrics import parse_gt, gt_diagnostics  # noqa: E402
 from src.sampling import region_sample_keys, context_owners, DEFAULT_REGION_KEYS  # noqa: E402
-from src.two_stage import block_candidates, add_context, fit_pipeline, predict_chunked, id_lists, project_blocking  # noqa: E402
+from src.two_stage import (block_candidates, add_context, fit_pipeline, id_lists, mem_info,  # noqa: E402
+                           predict_by_country, release_memory, split_by_country)
 
 
 def main(a):
@@ -48,7 +50,8 @@ def main(a):
     FE.NAME_VOCAB = build_vocab(re.sub(r"[^a-z0-9]+", " ", str(x).lower()) for x in s1["business_name"])
     log(f"  native-script map: {len(FE.NATIVE_MAP['name']):,} words; name vocabulary {len(FE.NAME_VOCAB):,}")
     s1_all, gt_all = s1, gt
-    s1, s23, gt = region_sample_keys(s1_all, s2, s3, gt_all, a.regions, n_jobs=FE.N_JOBS, fork_map=FE._fork_map, log=log)
+    s1, s23, gt = region_sample_keys(s1_all, s2, s3, gt_all, a.regions, n_jobs=FE.N_JOBS, fork_map=FE._fork_map, log=log,
+                                     orphan_frac=a.orphan_frac)
     del s2, s3
     gt_dict = parse_gt(gt)
     log(f"  S1={len(s1):,} S23={len(s23):,} true pairs={sum(map(len, gt_dict.values())):,}")
@@ -72,7 +75,10 @@ def main(a):
     log("[3/5] Prefilter, pair features, two-stage GBDT...")
     model = fit_pipeline(cands, s1p, s23p, y, n_true, log=log, core=core)
     recall = model["recall_prefilter"]
-    del cands, s1p, s23p
+    model.pop("pairs", None), model.pop("part", None)
+    del cands, s1p, s23p, s1, s23, gt, gt_dict, y, n_true
+    release_memory()
+    log(f"  training done ({time.time() - t0:.0f}s, {mem_info()})")
 
     log("[4/5] Test inference...")
     ts1, ts2, ts3 = (read_tsv(test_dir / f"test_source{k}.tsv") for k in (1, 2, 3))
@@ -81,26 +87,35 @@ def main(a):
     ts23 = pd.concat([ts2, ts3], ignore_index=True)
     del ts2, ts3
     FE.NAME_VOCAB = build_vocab(re.sub(r"[^a-z0-9]+", " ", str(x).lower()) for x in ts1["business_name"])
-    ts1p, ts23p = prepare_side(ts1), prepare_side(ts23)
-    project_blocking(ts1p, ts23p, budget_s=a.block_budget_min * 60, log=log)
-    cands, sel = predict_chunked(ts1p, ts23p, model, chunk_size=a.chunk_size,
-                                 cache_dir=str(out_dir.parent / "stage2_cache"), log=log)
+    ids1, ids23, n_ts1 = ts1["entity_id"].to_numpy(), ts23["entity_id"].to_numpy(), len(ts1)
+    # one country at a time (candidates never cross countries): the whole test set prepared at once needs ~20 GB
+    spill = out_dir.parent / "test_by_country"
+    parts = split_by_country(ts1, ts23, str(spill), log=log)
+    del ts1, ts23
+    release_memory()
+    slim = ("business_name", "business_address", "ml_addr")
+    cands, sel = predict_by_country(parts, model, lambda df: prepare_side(df, drop=slim), chunk_size=a.chunk_size,
+                                    cache_dir=str(out_dir.parent / "stage2_cache"),
+                                    block_budget_s=a.block_budget_min * 60, log=log)
+    shutil.rmtree(spill, ignore_errors=True)
 
     log("[5/5] Writing outputs...")
-    ids1, ids23 = ts1p["entity_id"].to_numpy(), ts23p["entity_id"].to_numpy()
     cand_out = pd.DataFrame({"source1_entity_id": ids1,
                              "candidate_entity_ids": id_lists(len(ids1), cands.qi.to_numpy(), cands.di.to_numpy(), ids23)})
     match_out = pd.DataFrame({"source1_entity_id": ids1,
                               "matched_entity_ids": id_lists(len(ids1), sel.qi.to_numpy(), sel.di.to_numpy(), ids23)})
-    assert len(match_out) == len(ts1) and match_out.source1_entity_id.is_unique
+    assert len(match_out) == n_ts1 and match_out.source1_entity_id.is_unique
     cand_out.to_csv(out_dir / "candidate_pairs.tsv", sep="\t", index=False)
     match_out.to_csv(out_dir / "matching_results.tsv", sep="\t", index=False)
     metrics = {"f05_heldout_two_stage": round(model["f05_test"], 4),
                "f05_heldout_stage1": round(model["f05_test_stage1"], 4),
-               "tau1": round(model["t1"], 2), "tau2": round(model["t2"], 2),
+               "tau1": round(model["t1"], 2), "tau2": round(model["t2"], 2), "decision_rule": model.get("policy"),
+               "f05_heldout_thresholds_rule": round(model["f05_test_thresholds"], 4),
+               "f05_heldout_expected_f_rule": round(model["f05_test_expected_f"], 4),
+               "orphan_frac": a.orphan_frac,
                "blocking_recall_train": round(float(model["recall_blocking"]), 4),
                "prefilter_recall_train": round(float(recall), 4),
-               "test_s1": len(ts1), "test_candidates": len(cands), "test_matches": len(sel),
+               "test_s1": n_ts1, "test_candidates": len(cands), "test_matches": len(sel),
                "runtime_s": round(time.time() - t0)}
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     log(json.dumps(metrics, indent=2))
@@ -123,5 +138,7 @@ if __name__ == "__main__":
     ap.add_argument("--validator", default=None)
     ap.add_argument("--context", action="store_true", help="add context owners in training (notebook: USE_CONTEXT)")
     ap.add_argument("--block-budget-min", type=float, default=180, help="test blocking time budget (minutes)")
+    ap.add_argument("--orphan-frac", type=float, default=0.19,
+                    help="share of training Source 1 removed (their Source 2/3 stay as distractors): test density")
     ap.add_argument("--dev", action="store_true")
     main(ap.parse_args())

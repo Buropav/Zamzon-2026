@@ -19,11 +19,12 @@ globally; pass 2 applies stage 2 chunk by chunk; selection is global.
 """
 # <package-only>
 from .blocking import _topk_rows, union_candidates
-from .features import pair_features
+from .features import pair_features, _TFIDF_CACHE
 from .extra_feats import num_matrix, num_features
 from .global_names import GN_COLS
 from .groups import s1_side_features, s23_side_features, stage2_matrix
-from .metrics import macro_f05, select_matches, tune_policy
+from .metrics import macro_f05, select_matches, select_policy, tune_expected_f, tune_policy
+from .text import canon_country
 # </package-only>
 import gc
 import os
@@ -379,6 +380,12 @@ def iter_candidate_chunks(qp, dp, chunk_size=250_000, min_sim=0.015, max_df=0.01
 
 
 BLK_COLS = [f"blk_{n}" for n, _ in BLOCKERS] + [f"blk_r{n}" for n, _ in REVERSE] + [f"blk_{n}" for n, _, _ in KEYS]
+_VIEWS0 = (BLOCKERS, REVERSE)  # configured views (project_blocking may drop some for one test country)
+
+
+def reset_blocking():
+    global BLOCKERS, REVERSE
+    BLOCKERS, REVERSE = _VIEWS0
 
 
 def _union_fast(blocks):
@@ -611,17 +618,27 @@ def train_two_stage(cands, X, y, n_true, s23p, seed=42, folds=5, log=print, core
     g = c.loc[c.groupby("di")["score"].idxmax()]
     gq = part[g["qi"].to_numpy()]
     f_val, t1, t2 = tune_policy(g[gq == 1], "score", n_true, val_ids, one_to_one=False)
-    sel = select_matches(g[gq == 2], "score", t1, t2, one_to_one=False)
-    f_test = macro_f05(sel, n_true, test_ids)
+    policy = {"rule": "thresholds", "t1": t1, "t2": t2}
+    f_thr = macro_f05(select_matches(g[gq == 2], "score", t1, t2, one_to_one=False), n_true, test_ids)
+    # expected-F0.5 set rule (per Source 1, the top-k with the highest expected F0.5): used only if it beats the
+    # two thresholds on the tuning part
+    f_val_e, pol_e = tune_expected_f(g[gq == 1], "score", n_true, val_ids)
+    f_exp = macro_f05(select_policy(g[gq == 2], "score", pol_e, one_to_one=False), n_true, test_ids)
+    log(f"  decision rules on held-out: thresholds {f_thr:.4f} (tuning part {f_val:.4f}), expected-F0.5 {f_exp:.4f} "
+        f"(tuning part {f_val_e:.4f}, {pol_e})")
+    if f_val_e > f_val:
+        policy, f_val = pol_e, f_val_e
+    f_test = f_exp if policy["rule"] == "expected_f" else f_thr
     # stage 1 alone, for reference
     c["s1score"] = clf1.predict_proba(X)[:, 1]
     g1 = c.loc[c.groupby("di")["s1score"].idxmax()]
     g1q = part[g1["qi"].to_numpy()]
     f1v, a1, a2 = tune_policy(g1[g1q == 1], "s1score", n_true, val_ids, one_to_one=False)
     f1t = macro_f05(select_matches(g1[g1q == 2], "s1score", a1, a2, one_to_one=False), n_true, test_ids)
-    log(f"  held-out Macro F0.5: stage 1 = {f1t:.4f}, two-stage = {f_test:.4f} (tau1={t1:.2f}, tau2={t2:.2f})")
+    log(f"  held-out Macro F0.5: stage 1 = {f1t:.4f}, two-stage = {f_test:.4f} (rule: {policy})")
     imp = clf2.importance()
-    return {"clf1": clf1, "clf2": clf2, "t1": t1, "t2": t2, "f05_val": f_val, "f05_test": f_test,
+    return {"clf1": clf1, "clf2": clf2, "t1": t1, "t2": t2, "policy": policy, "f05_val": f_val, "f05_test": f_test,
+            "f05_test_thresholds": f_thr, "f05_test_expected_f": f_exp,
             "f05_test_stage1": f1t, "stage2_cols": list(X2.columns), "stage2_importance": imp,
             "part": part, "pairs": c}
 
@@ -734,8 +751,110 @@ def predict_chunked(test_s1p, test_s23p, model, chunk_size=250_000, cache_dir="s
     shutil.rmtree(cache_dir, ignore_errors=True)
     log(f"  [pass 2] stage 2 scored {len(qi):,} pairs ({time.time() - t0:.0f}s)")
     cands = pd.DataFrame({"qi": qi, "di": di, "score": score})
-    selected = select_matches(cands, "score", model["t1"], model["t2"], one_to_one=True)
-    return cands, selected
+    return cands, apply_policy(cands, model)
+
+
+def apply_policy(cands, model):
+    """Final selection: one Source 1 per Source 2/3 record, then the tuned decision rule."""
+    policy = model.get("policy") or {"rule": "thresholds", "t1": model["t1"], "t2": model["t2"]}
+    return select_policy(cands, "score", policy, one_to_one=True)
+
+
+def release_memory():
+    """gc, then hand freed heap pages back to the OS (glibc keeps them otherwise, so the next country's
+    tables and the forked workers would need fresh pages on top)."""
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def mem_info():
+    """'RSS 9.1 GB | container 12.3/30.0 GB' (cgroup figures when available, else the machine's)."""
+    def read(path):
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+    rss = ""
+    for line in read("/proc/self/status").splitlines():
+        if line.startswith("VmRSS:"):
+            rss = f"RSS {int(line.split()[1]) / 1e6:.1f} GB"
+    box = ""
+    for cur, lim in (("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+                     ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes")):
+        c, l_ = read(cur), read(lim)
+        if c.isdigit() and l_.isdigit() and int(l_) < 1 << 50:
+            box = f"container {int(c) / 1e9:.1f}/{int(l_) / 1e9:.1f} GB"
+            break
+    if not box:
+        m = {}
+        for line in read("/proc/meminfo").splitlines():
+            k, _, v = line.partition(":")
+            m[k] = v.split()[0] if v.split() else "0"
+        if "MemTotal" in m and "MemAvailable" in m:
+            tot, av = int(m["MemTotal"]) * 1024, int(m["MemAvailable"]) * 1024
+            box = f"machine {(tot - av) / 1e9:.1f}/{tot / 1e9:.1f} GB"
+    return " | ".join(x for x in (rss, box) if x) or "RAM n/a"
+
+
+def split_by_country(s1, s23, spill_dir, log=print):
+    """Writes each country's raw Source 1 / Source 2/3 rows to spill_dir, largest country first, so that test
+    inference holds ONE country in memory at a time (the full test set prepared at once needs ~20 GB on top of
+    the raw tables). Source 2/3 rows without a country join every country, as in the blocking pools.
+    -> [(country, Source 1 positions, Source 2/3 positions, Source 1 file, Source 2/3 file)]"""
+    os.makedirs(spill_dir, exist_ok=True)
+    c1 = s1["country"].map(canon_country).to_numpy(object)
+    c23 = s23["country"].map(canon_country).to_numpy(object)
+    out = []
+    for c in sorted(pd.unique(c1), key=lambda x: -(c1 == x).sum()):
+        i1 = np.flatnonzero(c1 == c)
+        i23 = np.arange(len(s23)) if c == "" else np.flatnonzero((c23 == c) | (c23 == ""))
+        f1, f23 = os.path.join(spill_dir, f"s1_{len(out)}.pkl"), os.path.join(spill_dir, f"s23_{len(out)}.pkl")
+        s1.iloc[i1].to_pickle(f1)
+        s23.iloc[i23].to_pickle(f23)
+        out.append((c, i1, i23, f1, f23))
+        log(f"  {c or '<no country>'}: {len(i1):,} S1, {len(i23):,} S2/S3 set aside")
+    return out
+
+
+def predict_by_country(parts, model, prepare, chunk_size=100_000, cache_dir="stage2_cache", block_budget_s=None,
+                       make_gnames=None, log=print):
+    """Test inference one country at a time (parts from split_by_country). Blocking pools, TF-IDF fits and
+    group features never cross countries, so this scores the same pairs as a single pass; only the final
+    one-to-one selection runs over all countries together. prepare: raw table -> prepared table.
+    block_budget_s: time budget for all test blocking; a country whose projected blocking time exceeds what is
+    left (minus a reserve for the countries after it) drops optional views.
+    Returns (cands, selected) with qi / di as positions in the ORIGINAL Source 1 / Source 2/3 tables."""
+    Q, D, S = [], [], []
+    t0, sec0 = time.time(), BLOCK_STATS["seconds"]
+    for n, (c, i1, i23, f1, f23) in enumerate(parts):
+        reset_blocking()
+        s1p = prepare(pd.read_pickle(f1))
+        os.remove(f1)
+        s23p = prepare(pd.read_pickle(f23))
+        os.remove(f23)
+        release_memory()
+        log(f"  {c}: prepared {len(s1p):,} S1 / {len(s23p):,} S2/S3 ({time.time() - t0:.0f}s, {mem_info()})")
+        if block_budget_s:
+            left = block_budget_s - (BLOCK_STATS["seconds"] - sec0) - 600 * (len(parts) - n - 1)
+            project_blocking(s1p, s23p, budget_s=max(left, 600), log=log)
+        gn = make_gnames(s1p, s23p) if (make_gnames is not None and model.get("uses_gnames")) else None
+        cands, _ = predict_chunked(s1p, s23p, model, chunk_size=chunk_size, cache_dir=cache_dir, log=log, gnames=gn)
+        Q.append(i1[cands["qi"].to_numpy()])
+        D.append(i23[cands["di"].to_numpy()])
+        S.append(cands["score"].to_numpy(np.float32))
+        del s1p, s23p, cands, gn
+        _TFIDF_CACHE.clear()
+        release_memory()
+        log(f"  {c}: scored ({time.time() - t0:.0f}s, {mem_info()})")
+    reset_blocking()
+    cands = pd.DataFrame({"qi": np.concatenate(Q).astype(np.int64), "di": np.concatenate(D).astype(np.int64),
+                          "score": np.concatenate(S)})
+    return cands, apply_policy(cands, model)
 
 
 def id_lists(n_s1, qi, di, s23_ids):
