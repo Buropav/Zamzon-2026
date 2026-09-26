@@ -27,6 +27,10 @@ ALIASES = {  # state -> (country, last-address-component spellings seen in the t
     "KA": ("India", {"KARNATAKA", "ಕರ್ನಾಟಕ", "KA"}),
     "PB": ("India", {"PUNJAB", "PB", "ਪੰਜਾਬ"}),
     "HR": ("India", {"HARYANA", "HR", "हरियाणा"}),
+    "UP": ("India", {"UTTAR PRADESH", "UP", "उत्तर प्रदेश"}),
+    "MP": ("India", {"MADHYA PRADESH", "MP", "मध्य प्रदेश"}),
+    "RJ": ("India", {"RAJASTHAN", "RJ", "राजस्थान"}),
+    "BR": ("India", {"BIHAR", "BR", "बिहार"}),
 }
 STATELESS = {"", "NULL", "N/A", "<NULL>", "NONE", "NA", "-"}
 SEED = 42
